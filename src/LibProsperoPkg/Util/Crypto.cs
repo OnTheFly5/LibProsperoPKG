@@ -121,24 +121,18 @@ public static class Crypto
     /// <summary>
     /// Computes the SHA3-256 hash of the given data. SHA3-256 is the digest primitive used by the
     /// PS5 PFS: outer-image EKPFS key derivation, the compressed-file 'PFSC' digests, and
-    /// the per-block hashes. Requires a runtime/platform that provides SHA-3 (verified on .NET 10).
+    /// the per-block hashes. Uses a managed fallback when native SHA-3 is unavailable.
     /// </summary>
     public static byte[] Sha3_256(byte[] data)
     {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for PS5 PFS key derivation and digests but is not available on this platform/runtime.");
-        return SHA3_256.HashData(data);
+        return Sha3Digest.HashData(data);
     }
 
     /// <summary>Computes the SHA3-256 hash over the whole stream (used for PS5 CNT body/entry digests).</summary>
     public static byte[] Sha3_256(Stream data)
     {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for PS5 PFS digests but is not available on this platform/runtime.");
         data.Position = 0;
-        return SHA3_256.HashData(data);
+        return Sha3Digest.HashData(data);
     }
 
     /// <summary>

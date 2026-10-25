@@ -68,6 +68,27 @@ This produces `LibProsperoPkg.dll`.
 
 ---
 
+## NativeAOT and portable hashing
+
+The library enables NativeAOT/trimming analysis. GP5 XML is read and written explicitly,
+without runtime code generation. SHA3-256 uses the platform implementation when available
+and a managed acryptohashnet fallback otherwise, including streams and incremental digests.
+The vendored subset and its license/provenance are under `src/LibProsperoPkg/ThirdParty/ACryptoHashNet`.
+A native host still needs a separate C ABI wrapper that exports the operations it consumes.
+
+Run the dependency-free regression executable (SHA3 vectors, incremental hashing, XML
+compatibility against the original serializer, and AOT helper paths):
+
+```bash
+dotnet run --project tests/LibProsperoPkg.Tests -c Release
+```
+
+The native fallback validation is also versioned in `tests/LibProsperoPkg.NativeTests`,
+including 520 independent SHA3 reference vectors. Its NativeAOT executable performs 5201
+checks of buffers, streams, spans, reuse and incremental updates. See that project's README
+for standalone publishing; OnTheFly5's `Scripts/ProbeNativeAot.py` builds these fork sources
+directly and redirects all generated files using `--artifacts-path`.
+
 ## Quick start
 
 Add the project (or the built `LibProsperoPkg.dll`) to your build and create a package from a

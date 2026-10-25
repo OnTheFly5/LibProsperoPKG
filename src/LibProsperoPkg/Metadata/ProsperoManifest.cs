@@ -197,7 +197,7 @@ public sealed class ProsperoManifest
         ArgumentNullException.ThrowIfNull(values);
         var arr = new JsonArray();
         foreach (string value in values)
-            arr.Add(value);
+            arr.Add((JsonNode?)JsonValue.Create(value));
         Root[ProsperoManifestKeys.EnableAccessibility] = arr;
     }
 

@@ -4,6 +4,7 @@
 // Shared utility primitives: crypto, binary IO and stream helpers.
 #nullable disable
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 
@@ -11,15 +12,15 @@ namespace LibProsperoPkg.Util;
 
 static class MemoryReaderExtensions
 {
-    public static void Read<T>(this IMemoryReader reader, long pos, out T value) where T : struct
+    public static void Read<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(this IMemoryReader reader, long pos, out T value) where T : struct
     {
-        int sizeOfT = Marshal.SizeOf(typeof(T));
+        int sizeOfT = Marshal.SizeOf<T>();
         var buf = new byte[sizeOfT];
         reader.Read(pos, buf, 0, sizeOfT);
         value = ByteArrayToStructure<T>(buf, 0);
     }
 
-    public static void ReadArray<T>(this IMemoryReader reader, long pos, T[] value, int offset, int count) where T : struct
+    public static void ReadArray<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(this IMemoryReader reader, long pos, T[] value, int offset, int count) where T : struct
     {
         // Fast path for bytes
         if (value is byte[] b)
@@ -28,7 +29,7 @@ static class MemoryReaderExtensions
             return;
         }
         // Slow path
-        int sizeOfT = Marshal.SizeOf(typeof(T));
+        int sizeOfT = Marshal.SizeOf<T>();
         var buf = new byte[sizeOfT * count];
         reader.Read(pos, buf, 0, sizeOfT * count);
         for (var i = 0; i < count; i++)
@@ -38,18 +39,18 @@ static class MemoryReaderExtensions
     }
 
     // https://stackoverflow.com/a/2887
-    private static unsafe T ByteArrayToStructure<T>(byte[] bytes, int offset) where T : struct
+    private static unsafe T ByteArrayToStructure<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(byte[] bytes, int offset) where T : struct
     {
         fixed (byte* ptr = &bytes[offset])
         {
-            return (T)Marshal.PtrToStructure((IntPtr)ptr, typeof(T));
+            return Marshal.PtrToStructure<T>((IntPtr)ptr);
         }
     }
 }
 public interface IMemoryAccessor : IMemoryReader
 {
-    void Read<T>(long pos, out T value) where T : struct;
-    void ReadArray<T>(long pos, T[] value, int offset, int count) where T : struct;
+    void Read<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(long pos, out T value) where T : struct;
+    void ReadArray<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(long pos, T[] value, int offset, int count) where T : struct;
 }
 public interface IMemoryReader : IDisposable
 {
@@ -74,7 +75,7 @@ class MemoryAccessor : IMemoryAccessor
         }
     }
     public void Dispose() { }
-    public void Read<T>(long pos, out T value) where T : struct
+    public void Read<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(long pos, out T value) where T : struct
     {
         reader.Read(pos + offset, out value);
     }
@@ -82,7 +83,7 @@ class MemoryAccessor : IMemoryAccessor
     {
         reader.Read(pos + this.offset, buf, offset, count);
     }
-    public void ReadArray<T>(long pos, T[] value, int offset, int count) where T : struct
+    public void ReadArray<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(long pos, T[] value, int offset, int count) where T : struct
     {
         reader.ReadArray(pos + this.offset, value, offset, count);
     }
@@ -170,12 +171,12 @@ public class MemoryMappedViewAccessor_ : IMemoryAccessor
             _va.Dispose();
     }
 
-    public void Read<T>(long pos, out T value) where T : struct
+    public void Read<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(long pos, out T value) where T : struct
     {
         _va.Read(pos, out value);
     }
 
-    public void ReadArray<T>(long pos, T[] value, int offset, int count) where T : struct
+    public void ReadArray<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors)] T>(long pos, T[] value, int offset, int count) where T : struct
     {
         _va.ReadArray(pos, value, offset, count);
     }

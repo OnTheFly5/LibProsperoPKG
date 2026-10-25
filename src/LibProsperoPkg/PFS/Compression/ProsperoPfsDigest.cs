@@ -8,6 +8,7 @@
 // SHA3-256(uncompressed block bytes), and the header's "File Digest (SHA3)" at offset 0x28
 // is a SHA3-256 value.
 #nullable enable
+using LibProsperoPkg.Util;
 using System;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
@@ -22,8 +23,8 @@ namespace LibProsperoPkg.PFS.Compression;
 /// <remarks>
 /// SHA3-256 is the hash primitive used throughout the PFS compression format. Per-block
 /// hashes are taken over the <i>uncompressed</i> block bytes, which is what
-/// <see cref="ComputeBlockDigest(System.ReadOnlySpan{byte})"/> returns. The host runtime must
-/// support SHA3-256; query <see cref="IsSupported"/> before use.
+/// <see cref="ComputeBlockDigest(System.ReadOnlySpan{byte})"/> returns. A portable managed fallback is used when
+/// the host runtime does not provide native SHA3-256.
 /// </remarks>
 public static class ProsperoPfsDigest
 {
@@ -31,9 +32,9 @@ public static class ProsperoPfsDigest
     public const int DigestLength = 32;
 
     /// <summary>
-    /// Gets a value indicating whether the host runtime and operating system provide SHA3-256.
+    /// Gets a value indicating whether SHA3-256 is available (including the managed fallback).
     /// </summary>
-    public static bool IsSupported => SHA3_256.IsSupported;
+    public static bool IsSupported => true;
 
     /// <summary>
     /// Computes the SHA3-256 digest of a single PFS block's <b>uncompressed</b> bytes, matching the
@@ -41,11 +42,9 @@ public static class ProsperoPfsDigest
     /// </summary>
     /// <param name="uncompressedBlock">The raw (pre-compression, post-deshuffle) block bytes.</param>
     /// <returns>The 32-byte SHA3-256 digest.</returns>
-    /// <exception cref="PlatformNotSupportedException">SHA3-256 is unavailable on this host.</exception>
     public static byte[] ComputeBlockDigest(ReadOnlySpan<byte> uncompressedBlock)
     {
-        EnsureSupported();
-        return SHA3_256.HashData(uncompressedBlock);
+        return Sha3Digest.HashData(uncompressedBlock);
     }
 
     /// <summary>
@@ -54,11 +53,9 @@ public static class ProsperoPfsDigest
     /// <param name="data">The bytes to hash.</param>
     /// <param name="destination">A span of at least <see cref="DigestLength"/> bytes.</param>
     /// <returns>The number of bytes written (always <see cref="DigestLength"/>).</returns>
-    /// <exception cref="PlatformNotSupportedException">SHA3-256 is unavailable on this host.</exception>
     public static int ComputeBlockDigest(ReadOnlySpan<byte> data, Span<byte> destination)
     {
-        EnsureSupported();
-        return SHA3_256.HashData(data, destination);
+        return Sha3Digest.HashData(data, destination);
     }
 
     /// <summary>
@@ -71,17 +68,9 @@ public static class ProsperoPfsDigest
     {
         if (expected.Length != DigestLength)
             return false;
-        EnsureSupported();
         Span<byte> actual = stackalloc byte[DigestLength];
-        SHA3_256.HashData(uncompressedBlock, actual);
+        Sha3Digest.HashData(uncompressedBlock, actual);
         return CryptographicOperations.FixedTimeEquals(actual, expected);
-    }
-
-    private static void EnsureSupported()
-    {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for the PS5 PFSv3 compression format but is not available on this host.");
     }
 
     /// <summary>The length, in bytes, of the header parameter slice (<c>container[0x08..0x20]</c>) the file digest hashes.</summary>
@@ -106,7 +95,6 @@ public static class ProsperoPfsDigest
     /// This layout applies to independent encoder outputs (compressed and stored blocks).
     /// </remarks>
     /// <exception cref="ArgumentException"><paramref name="headerParams"/> is not 24 bytes.</exception>
-    /// <exception cref="PlatformNotSupportedException">SHA3-256 is unavailable on this host.</exception>
     public static byte[] ComputeFileDigest(
         ReadOnlySpan<byte> headerParams,
         ReadOnlySpan<byte> shuffleSection,
@@ -117,16 +105,16 @@ public static class ProsperoPfsDigest
             throw new ArgumentException(
                 $"headerParams must be exactly {FileDigestHeaderParamsLength} bytes (container[0x08..0x20]).",
                 nameof(headerParams));
-        EnsureSupported();
 
         // header32: {u32 1, u32 blockSize, u32 param0C, u32 0(pad), u64 param10, u64 uncompressedSize}.
         Span<byte> header32 = stackalloc byte[32];
+        header32.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(header32, 1u);
         headerParams[..8].CopyTo(header32[4..]);   // blockSize (0x08) + param0C (0x0C)
         // header32[12..16] stays zero (alignment padding).
         headerParams[8..].CopyTo(header32[16..]);  // param10 (0x10) + uncompressedSize (0x18)
 
-        using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA3_256);
+        using var hash = new Sha3Digest();
         hash.AppendData(header32);
         hash.AppendData(shuffleSection);
         hash.AppendData(boundarySection);

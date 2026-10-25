@@ -73,6 +73,7 @@
 // (different pfs_image ⇒ different superblock ⇒ different game/content/header/package digests). The
 // formulas here are exact and self-consistent.
 
+using LibProsperoPkg.Util;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
@@ -151,15 +152,11 @@ public static class ProsperoImageDigests
     private static ReadOnlySpan<byte> SuperblockMagic => [0x0b, 0x2a, 0x33, 0x01];
 
     /// <summary>
-    /// SHA3-256, the single PS5 PFS/finalized-image digest primitive. Throws on a runtime without
-    /// SHA-3 (the whole PS5 path requires it).
+    /// SHA3-256, the single PS5 PFS/finalized-image digest primitive, with a portable fallback.
     /// </summary>
     public static byte[] Sha3_256(ReadOnlySpan<byte> data)
     {
-        if (!SHA3_256.IsSupported)
-            throw new PlatformNotSupportedException(
-                "SHA3-256 is required for PS5 finalized-image digests but is not available on this platform/runtime.");
-        return SHA3_256.HashData(data);
+        return Sha3Digest.HashData(data);
     }
 
     /// <summary>

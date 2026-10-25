@@ -342,7 +342,7 @@ public sealed class ProsperoParam
             arr = new JsonArray();
             gi[ProsperoParamKeys.PermittedIntents] = arr;
         }
-        arr.Add(new JsonObject { [ProsperoParamKeys.IntentType] = ProsperoIntentTypes.ToToken(intent) });
+        arr.Add((JsonNode)new JsonObject { [ProsperoParamKeys.IntentType] = ProsperoIntentTypes.ToToken(intent) });
     }
 
     /// <summary>Replaces the <c>gameIntent.permittedIntents</c> block with the given intents (in order).</summary>
@@ -351,7 +351,7 @@ public sealed class ProsperoParam
         ArgumentNullException.ThrowIfNull(intents);
         var arr = new JsonArray();
         foreach (ProsperoIntentType intent in intents)
-            arr.Add(new JsonObject { [ProsperoParamKeys.IntentType] = ProsperoIntentTypes.ToToken(intent) });
+            arr.Add((JsonNode)new JsonObject { [ProsperoParamKeys.IntentType] = ProsperoIntentTypes.ToToken(intent) });
         GetOrCreateObject(ProsperoParamKeys.GameIntent)[ProsperoParamKeys.PermittedIntents] = arr;
     }
 
@@ -374,7 +374,7 @@ public sealed class ProsperoParam
         ArgumentNullException.ThrowIfNull(serviceIds);
         var arr = new JsonArray();
         foreach (string id in serviceIds)
-            arr.Add(id);
+            arr.Add((JsonNode?)JsonValue.Create(id));
         GetOrCreateObject(ProsperoParamKeys.AddCont)[ProsperoParamKeys.ServiceIdForSharing] = arr;
     }
 

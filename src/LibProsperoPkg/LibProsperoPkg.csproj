@@ -10,6 +10,7 @@
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest</AnalysisLevel>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <IsAotCompatible>true</IsAotCompatible>
 
     <!-- Documentation comments reference some symbols by short name; do not fail the build on
          missing-XML-comment (CS1591) warnings. -->
@@ -30,6 +31,9 @@
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\NOTICE" Pack="true" PackagePath="\" />
+    <None Update="ThirdParty\ACryptoHashNet\LICENSE" Pack="true" PackagePath="licenses/acryptohashnet/" />
+    <None Update="ThirdParty\ACryptoHashNet\README.md" Pack="true" PackagePath="licenses/acryptohashnet/" />
   </ItemGroup>
 
   <ItemGroup>

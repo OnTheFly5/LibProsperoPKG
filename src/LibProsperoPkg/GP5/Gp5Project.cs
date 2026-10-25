@@ -9,7 +9,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Xml;
 using System.Xml.Serialization;
 
 namespace LibProsperoPkg.GP5;
@@ -106,10 +105,6 @@ public sealed class Gp5Project
     public bool ShouldSerializeFiles() => Files.Count > 0;
     public bool ShouldSerializeFolders() => Folders.Count > 0;
 
-    /// <summary>The XML namespaces written for a GP5 project (none).</summary>
-    private static readonly XmlSerializerNamespaces EmptyNamespaces =
-        new([XmlQualifiedName.Empty]);
-
     /// <summary>
     /// Creates a new, valid GP5 project with sensible Prospero defaults for the
     /// supplied volume type.
@@ -161,15 +156,7 @@ public sealed class Gp5Project
         ArgumentNullException.ThrowIfNull(project);
         ArgumentNullException.ThrowIfNull(stream);
 
-        var settings = new XmlWriterSettings
-        {
-            Indent = true,
-            IndentChars = "  ",
-            Encoding = new System.Text.UTF8Encoding(false),
-            OmitXmlDeclaration = false,
-        };
-        using var writer = XmlWriter.Create(stream, settings);
-        new XmlSerializer(typeof(Gp5Project)).Serialize(writer, project, EmptyNamespaces);
+        Gp5Xml.Write(project, stream);
     }
 
     /// <summary>Serializes the project to the given file path.</summary>
@@ -183,7 +170,7 @@ public sealed class Gp5Project
     public static Gp5Project ReadFrom(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        return (Gp5Project)new XmlSerializer(typeof(Gp5Project)).Deserialize(stream)!;
+        return Gp5Xml.Read(stream);
     }
 
     /// <summary>Reads a GP5 project from the given file path.</summary>
