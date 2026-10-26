@@ -14,6 +14,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
+using System.Threading;
 
 namespace LibProsperoPkg.PFS;
 
@@ -33,11 +35,14 @@ public sealed class ProsperoPs5InnerFile
     public ProsperoInnerFilePolicy? Policy { get; init; }
 }
 
-/// <summary>The assembled inner image plus the intermediate model (for verification/diagnostics).</summary>
-public sealed class ProsperoPs5InnerImageResult
+/// <summary>Inner-image geometry and metadata without retaining the file payloads.</summary>
+public class ProsperoPs5InnerImageLayout
 {
-    /// <summary>The on-disk inner <c>pfs_image.dat</c> bytes (data-first, per-file compressed).</summary>
-    public required byte[] Image { get; init; }
+    /// <summary>Number of bytes emitted for this inner image.</summary>
+    public long OutputLength { get; init; }
+    /// <summary>File block records in afid order, with offsets relative to each file.</summary>
+    public IReadOnlyList<IReadOnlyList<ProsperoInnerPayloadBlock>> FileBlocks { get; init; }
+        = Array.Empty<IReadOnlyList<ProsperoInnerPayloadBlock>>();
 
     /// <summary>The uncompressed metadata-region plaintext (the block that is Kraken-compressed into the image tail).</summary>
     public required byte[] MetadataPlaintext { get; init; }
@@ -75,6 +80,12 @@ public sealed class ProsperoPs5InnerImageResult
 
     /// <summary>Logical base of the metadata region in the mount (= Ndblock*64K - MetadataPlaintext.Length).</summary>
     public long MetaBaseLogical { get; init; }
+}
+
+/// <summary>Compatibility result retaining the entire inner image in memory.</summary>
+public sealed class ProsperoPs5InnerImageResult : ProsperoPs5InnerImageLayout
+{
+    public required byte[] Image { get; init; }
 }
 
 /// <summary>One file's on-disk + logical placement in the assembled inner image (afid order).</summary>
@@ -137,6 +148,10 @@ public sealed class ProsperoPs5InnerImageAssembler
         public string Name = "";
         public string FullPath = "";
         public byte[] Data = Array.Empty<byte>();
+        public ProsperoPs5InnerFileSource? Source;
+        public long Length => Source?.Length ?? Data.LongLength;
+        public long StreamedLength;
+        public long OnDiskLength => OnDiskData?.LongLength ?? StreamedLength;
         public Dir Parent = null!;
         public uint Inode;
         public uint Afid;
@@ -202,47 +217,8 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         Dir uroot = BuildTree(files);
 
-        // ---- 1. Assign inodes. ---------------------------------------------------------------------
-        // 0 = super-root, 1..3 = the three internal metadata files, 4 = uroot, then sub-directories in
-        // pre-order DFS, then regular files grouped by directory in *reverse* directory-inode order
-        // (deepest-assigned directory's files first), ordinal within a directory.
-        var dirsPreOrder = new List<Dir>();
-        CollectDirsPreOrder(uroot, dirsPreOrder); // uroot first, then descendants pre-order
-
-        uint next = 0;
-        var superRootInode = next++;      // 0
-        var inodeFltInode = next++;       // 1
-        var aprFltInode = next++;         // 2
-        var afidTableInode = next++;      // 3
-        foreach (var d in dirsPreOrder)   // uroot=4, subdirs...
-            d.Inode = next++;
-
-        // Files: directories in POST-ORDER DFS (deepest-first, siblings ordinal), files ordinal within each.
-        // (For a linear chain — e.g. nwonly's uroot/sce_sys/about — post-order == reverse pre-order, but for a
-        // branching tree they differ; post-order is the general rule.)
-        var dirsPostOrder = new List<Dir>();
-        CollectDirsPostOrder(uroot, dirsPostOrder);
-        var fileNodes = new List<FileNode>();
-        foreach (var d in dirsPostOrder)
-            foreach (var f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
-            {
-                f.Inode = next++;
-                fileNodes.Add(f);
-            }
-
-        // ---- 2. Assign afids. ----------------------------------------------------------------------
-        // sce_sys subtree files first (pre-order DFS), then the remaining uroot files (ordinal by name).
-        var afidOrder = new List<FileNode>();
-        Dir? sceSys = uroot.SubDirs.FirstOrDefault(d => d.Name == SceSysDir);
-        if (sceSys != null) CollectFilesPreOrder(sceSys, afidOrder);
-        foreach (var d in dirsPreOrder)
-            if (d != sceSys && !IsUnder(d, sceSys))
-                foreach (var f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
-                    afidOrder.Add(f);
-        // Any files directly in uroot come after the sce_sys subtree, ordinal (already covered by the
-        // loop above because uroot is in dirsPreOrder and is not under sce_sys).
-        for (uint a = 0; a < afidOrder.Count; a++)
-            afidOrder[(int)a].Afid = a;
+        var (dirsPreOrder, fileNodes, afidOrder, superRootInode,
+            inodeFltInode, aprFltInode, afidTableInode) = PrepareTree(uroot);
 
         // ---- 3. Logical offsets (packed, in afid order) + store rule. -----------------------------
         long cursor = 0;
@@ -251,7 +227,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         {
             f.LogicalOffset = cursor;
             afidOffsets[f.Afid] = cursor;
-            cursor += f.Data.Length;
+            cursor = checked(cursor + f.Length);
             // A signed module is stored verbatim; every other file is submitted to the codec, which
             // decides per block whether each one stays compressed. Compress once and reuse it so the
             // data-region geometry and the final image share a single compression pass.
@@ -309,19 +285,20 @@ public sealed class ProsperoPs5InnerImageAssembler
 
         long metaBaseLogical = ndblock * ProsperoPs5InnerImageBuilder.BlockSize - metaPlain.Length;
         long dataEndLogical = afidOrder.Count == 0 ? 0
-            : afidOrder[^1].LogicalOffset + afidOrder[^1].Data.Length;
+            : afidOrder[^1].LogicalOffset + afidOrder[^1].Length;
         var placements = afidOrder.Select(f => new ProsperoPs5InnerPlacement
         {
             OnDiskOffset = f.OnDiskOffset,
             LogicalOffset = f.LogicalOffset,
-            OnDiskSize = f.OnDiskData!.Length,
-            UncompressedSize = f.Data.Length,
+            OnDiskSize = f.OnDiskLength,
+            UncompressedSize = f.Length,
             StoreRaw = f.StoreRaw,
         }).ToList();
 
         return new ProsperoPs5InnerImageResult
         {
             Image = image,
+            OutputLength = image.LongLength,
             MetadataPlaintext = metaPlain,
             Nodes = nodes,
             Ndblock = ndblock,
@@ -334,6 +311,213 @@ public sealed class ProsperoPs5InnerImageAssembler
             DataEndLogical = dataEndLogical,
             MetaBaseLogical = metaBaseLogical,
         };
+    }
+
+    /// <summary>
+    /// Writes a data-first inner image without retaining file payloads or a complete image.
+    /// Output is append-only and need not be seekable or readable. Sources open once, in afid order.
+    /// Returned metadata/block records scale with file/block counts. Offsets are image-relative.
+    /// This is an inner-image API, not a complete FPKG builder; the caller owns the output stream.
+    /// </summary>
+    public ProsperoPs5InnerImageLayout Write(Stream destination,
+        IReadOnlyList<ProsperoPs5InnerFileSource> files, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(files);
+        if (!destination.CanWrite) throw new ArgumentException("Output must be writable.", nameof(destination));
+        if (files.Count == 0) throw new ArgumentException("At least one file is required.", nameof(files));
+        var sources = new Dictionary<string, ProsperoPs5InnerFileSource>(StringComparer.Ordinal);
+        var headers = new List<ProsperoPs5InnerFile>();
+        foreach (var file in files)
+        {
+            ArgumentNullException.ThrowIfNull(file);
+            ArgumentOutOfRangeException.ThrowIfNegative(file.Length);
+            ArgumentNullException.ThrowIfNull(file.OpenRead);
+            string path = file.Path?.TrimStart('/') ?? "";
+            if (path.Length == 0 || path.Split('/').Any(p => p.Length == 0 || p == "." || p == "..")
+                || path.Any(c => char.IsControl(c) || c == '\\') || !sources.TryAdd("/" + path, file))
+                throw new ArgumentException("Invalid or duplicate inner file path: " + file.Path, nameof(files));
+            headers.Add(new ProsperoPs5InnerFile { Path = path, Data = Array.Empty<byte>(), Policy = file.Policy });
+        }
+        foreach (string path in sources.Keys)
+            for (int slash = path.LastIndexOf('/'); slash > 0; slash = path.LastIndexOf('/', slash - 1))
+                if (sources.ContainsKey(path[..slash]))
+                    throw new ArgumentException("A file is also used as a directory: " + path, nameof(files));
+        cancellationToken.ThrowIfCancellationRequested();
+        Dir uroot = BuildTree(headers);
+        var (dirsPreOrder, fileNodes, afidOrder, superRootInode,
+            inodeFltInode, aprFltInode, afidTableInode) = PrepareTree(uroot);
+        // Current metadata format reserves one block for inodes and for each table/directory.
+        // Fail before opening any payload instead of overwriting adjacent metadata blocks.
+        if (4L + dirsPreOrder.Count + fileNodes.Count > BlockSize / 0xA8)
+            throw new NotSupportedException("Current inner metadata supports at most 390 inode records.");
+        BuildDirents(uroot);
+        if (dirsPreOrder.Any(d => DirentBytes(d.Dirents).Length > BlockSize)
+            || ProsperoPs5FlatPathTable.HeaderSize + 16L * (dirsPreOrder.Count - 1 + fileNodes.Count) > BlockSize
+            || 4L * (fileNodes.Count + 3) > BlockSize)
+            throw new NotSupportedException("Current inner metadata tables must each fit one 64 KiB block.");
+        var afidOffsets = new long[afidOrder.Count];
+        var fileBlocks = new List<IReadOnlyList<ProsperoInnerPayloadBlock>>();
+        long logical = 0, physical = 0;
+        foreach (var f in afidOrder)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            f.Source = sources[f.FullPath];
+            f.LogicalOffset = logical;
+            afidOffsets[f.Afid] = logical;
+            logical = checked(logical + f.Length);
+            using Stream source = f.Source.OpenRead()
+                ?? throw new InvalidOperationException("Source factory returned null: " + f.FullPath);
+            if (!source.CanRead) throw new ArgumentException("Unreadable source: " + f.FullPath);
+            f.Data = new byte[(int)Math.Min(f.Length, ProsperoInnerFileClassifier.HeaderLength)];
+            source.ReadExactly(f.Data);
+            var policy = f.Policy ?? ProsperoInnerFileClassifier.Classify(f.Data);
+            f.StoreRaw = f.Length == 0 || policy is ProsperoInnerFilePolicy.StoreVerbatim or ProsperoInnerFilePolicy.RequiresModuleConversion;
+            f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
+            f.WholeBlockRaw = IsKeystone(f.FullPath);
+            bool alignBefore = f.WholeBlockRaw ||
+                (f.StoreRaw && physical % BlockSize != 0 && f.Length > BlockSize - physical % BlockSize);
+            if (alignBefore) PadToBlock(destination, ref physical, cancellationToken);
+            f.OnDiskOffset = physical;
+            using var prefixed = new HeaderStream(f.Data, source);
+            var result = ProsperoPs5InnerImageBuilder.WritePayload(destination, prefixed,
+                f.Length, f.StoreRaw, cancellationToken);
+            // Source growth is not silently ignored: declared length is part of layout/integrity.
+            if (source.ReadByte() != -1) throw new InvalidDataException("Source grew: " + f.FullPath);
+            f.StreamedLength = result.Length;
+            fileBlocks.Add(result.Blocks);
+            physical = checked(physical + result.Length);
+            if (f.WholeBlockRaw) PadToBlock(destination, ref physical, cancellationToken);
+        }
+        long dataBlocks = ComputeDataRegionBlocks(afidOrder);
+        while ((dataBlocks + 61) % 4 != 0) dataBlocks++;
+        BuildDirents(uroot);
+        var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, dataBlocks,
+            superRootInode, inodeFltInode, aprFltInode, afidTableInode, out long ndblock);
+        byte[] metadata = BuildMetadataPlaintext(nodes, dirsPreOrder, fileNodes, afidOrder,
+            ndblock, inodeFltInode, aprFltInode, afidTableInode, uroot);
+        long metaBase = checked(ndblock * BlockSize - metadata.LongLength);
+        if (logical > metaBase)
+            throw new NotSupportedException("Current inner mount geometry overlaps file data and metadata.");
+        PadToBlock(destination, ref physical, cancellationToken);
+        long blockInfoOffset = physical;
+        byte[] blockInfo = BuildBlockInfoTable(afidOrder.Where(f => !f.SceSys).Sum(f => f.Length));
+        destination.Write(blockInfo);
+        physical += blockInfo.Length;
+        PadToBlock(destination, ref physical, cancellationToken);
+        long metadataOffset = physical;
+        byte[] compressedMetadata = ProsperoPs5InnerImageBuilder.CompressPayload(metadata,
+            storeRaw: false, out var metadataFile);
+        cancellationToken.ThrowIfCancellationRequested();
+        destination.Write(compressedMetadata);
+        physical = checked(physical + compressedMetadata.LongLength);
+        var metadataBlocks = metadataFile is null ? Array.Empty<ProsperoInnerMetaBlockChunk>()
+            : metadataFile.Blocks.Select(b => new ProsperoInnerMetaBlockChunk(b.CompressedSize,
+                b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToArray();
+        return new ProsperoPs5InnerImageLayout
+        {
+            OutputLength = physical, MetadataPlaintext = metadata, Nodes = nodes, Ndblock = ndblock,
+            AfidLogicalOffsets = afidOffsets, FileBlocks = fileBlocks,
+            Placements = afidOrder.Select(f => new ProsperoPs5InnerPlacement
+            {
+                OnDiskOffset = f.OnDiskOffset, LogicalOffset = f.LogicalOffset,
+                OnDiskSize = f.OnDiskLength, UncompressedSize = f.Length, StoreRaw = f.StoreRaw,
+            }).ToArray(),
+            BlockInfoOnDiskOffset = blockInfoOffset, MetadataOnDiskOffset = metadataOffset,
+            CompressedMetadata = compressedMetadata, MetadataBlocks = metadataBlocks,
+            DataEndLogical = logical, MetaBaseLogical = metaBase,
+        };
+    }
+
+    private static void PadToBlock(Stream destination, ref long position, CancellationToken cancellationToken)
+    {
+        long remaining = (BlockSize - position % BlockSize) % BlockSize;
+        Span<byte> zeros = stackalloc byte[4096];
+        zeros.Clear();
+        while (remaining > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int count = (int)Math.Min(zeros.Length, remaining);
+            destination.Write(zeros[..count]);
+            position += count;
+            remaining -= count;
+        }
+    }
+
+    // Replays the small classification header without reopening or seeking the source.
+    private sealed class HeaderStream(byte[] header, Stream source) : Stream
+    {
+        private int offset;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int start, int count) => Read(buffer.AsSpan(start, count));
+        public override int Read(Span<byte> buffer)
+        {
+            if (offset < header.Length)
+            {
+                int count = Math.Min(buffer.Length, header.Length - offset);
+                header.AsSpan(offset, count).CopyTo(buffer);
+                offset += count;
+                return count;
+            }
+            return source.Read(buffer);
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private static (List<Dir>, List<FileNode>, List<FileNode>, uint, uint, uint, uint)
+        PrepareTree(Dir uroot)
+    {
+        // ---- 1. Assign inodes. ---------------------------------------------------------------------
+        // 0 = super-root, 1..3 = the three internal metadata files, 4 = uroot, then sub-directories in
+        // pre-order DFS, then regular files grouped by directory in *reverse* directory-inode order
+        // (deepest-assigned directory's files first), ordinal within a directory.
+        var dirsPreOrder = new List<Dir>();
+        CollectDirsPreOrder(uroot, dirsPreOrder); // uroot first, then descendants pre-order
+
+        uint next = 0;
+        var superRootInode = next++;      // 0
+        var inodeFltInode = next++;       // 1
+        var aprFltInode = next++;         // 2
+        var afidTableInode = next++;      // 3
+        foreach (var d in dirsPreOrder)   // uroot=4, subdirs...
+            d.Inode = next++;
+
+        // Files: directories in POST-ORDER DFS (deepest-first, siblings ordinal), files ordinal within each.
+        // (For a linear chain — e.g. nwonly's uroot/sce_sys/about — post-order == reverse pre-order, but for a
+        // branching tree they differ; post-order is the general rule.)
+        var dirsPostOrder = new List<Dir>();
+        CollectDirsPostOrder(uroot, dirsPostOrder);
+        var fileNodes = new List<FileNode>();
+        foreach (var d in dirsPostOrder)
+            foreach (var f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
+            {
+                f.Inode = next++;
+                fileNodes.Add(f);
+            }
+
+        // ---- 2. Assign afids. ----------------------------------------------------------------------
+        // sce_sys subtree files first (pre-order DFS), then the remaining uroot files (ordinal by name).
+        var afidOrder = new List<FileNode>();
+        Dir? sceSys = uroot.SubDirs.FirstOrDefault(d => d.Name == SceSysDir);
+        if (sceSys != null) CollectFilesPreOrder(sceSys, afidOrder);
+        foreach (var d in dirsPreOrder)
+            if (d != sceSys && !IsUnder(d, sceSys))
+                foreach (var f in d.Files.OrderBy(f => f.Name, StringComparer.Ordinal))
+                    afidOrder.Add(f);
+        // Any files directly in uroot come after the sce_sys subtree, ordinal (already covered by the
+        // loop above because uroot is in dirsPreOrder and is not under sce_sys).
+        for (uint a = 0; a < afidOrder.Count; a++)
+            afidOrder[(int)a].Afid = a;
+
+        return (dirsPreOrder, fileNodes, afidOrder, superRootInode,
+            inodeFltInode, aprFltInode, afidTableInode);
     }
 
     // ---- Tree construction -------------------------------------------------------------------------
@@ -541,7 +725,7 @@ public sealed class ProsperoPs5InnerImageAssembler
                 // for a data blob (e.g. the DRM keystone), +0x20000 for the sce_sys subtree.
                 Flags = 0x10u | (exec ? 0x40u : 0x20u) | (sceSys ? 0x20000u : 0u),
                 Afid = f.Afid,
-                Size = f.Data.Length,
+                Size = f.Length,
                 LogicalOffset = (ulong)f.LogicalOffset,
                 ParentInode = (int)f.Parent.Inode,
                 DirentOffset = f.DirentOffsetInParent,
@@ -593,7 +777,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         {
             bool apr = !f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
             FI(f.FullPath, f.Inode, dir: false, subtreeApr: apr, afid: f.Afid);
-            if (apr) FA(f.FullPath, f.Data.Length, f.Afid);
+            if (apr) FA(f.FullPath, f.Length, f.Afid);
         }
 
         byte[] inodeFltBytes = ProsperoPs5FlatPathTable.ToBytes(inodeFlt);
@@ -657,13 +841,13 @@ public sealed class ProsperoPs5InnerImageAssembler
         long pos = 0;
         foreach (var f in afidOrder)
         {
-            byte[] data = f.OnDiskData!;
+            long length = f.OnDiskLength;
             // Raw files (keystone + executable modules) start block-aligned; the keystone additionally
             // occupies whole blocks so the data region begins on a fresh block after it. Compressed app
             // data packs contiguously.
             if (f.StoreRaw)
                 pos = RoundUp(pos, BlockSize);
-            pos += data.Length;
+            pos = checked(pos + length);
             if (f.WholeBlockRaw)
                 pos = RoundUp(pos, BlockSize);
         }
@@ -715,7 +899,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         // Its variable entry encodes the sub-256KiB remainder of the uroot payload size; see BuildBlockInfoTable.
         long urootSize = 0;
         foreach (var f in afidOrder)
-            if (!f.SceSys) urootSize += f.Data.Length;
+            if (!f.SceSys) urootSize += f.Length;
         byte[] blockInfo = BuildBlockInfoTable(urootSize);
         pos = AlignUp(pos, BLK);
         blockInfoOnDisk = pos;

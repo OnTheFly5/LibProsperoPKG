@@ -24,6 +24,7 @@ internal static class Program
         HashTests.Run();
         Gp5Tests.Run();
         AotHelpersTests.Run();
-        Console.WriteLine($"PASS {assertions} SHA3/GP5/AOT regression assertions.");
+        StreamingTests.Run();
+        Console.WriteLine($"PASS {assertions} SHA3/GP5/AOT/streaming regression assertions.");
     }
 }

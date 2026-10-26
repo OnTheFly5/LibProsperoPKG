@@ -78,6 +78,18 @@ public sealed class ProsperoPs5InnerImageBuilder
     }
 
     /// <summary>
+    /// Writes the inner-image payload representation directly to a writable, non-seekable stream.
+    /// Reads exactly sourceLength bytes once, retaining only bounded payload buffers and block records.
+    /// No PFSC wrapper is emitted: the returned records describe the concatenated Kraken/stored blocks.
+    /// The caller owns both streams. Cancellation and I/O errors leave incomplete output.
+    /// </summary>
+    public static ProsperoInnerPayloadResult WritePayload(Stream destination, Stream source,
+        long sourceLength, bool storeRaw = false,
+        System.Threading.CancellationToken cancellationToken = default)
+        => ProsperoCompressedPfsFileWriter.WritePayload(destination, source, sourceLength,
+            storeRaw, cancellationToken);
+
+    /// <summary>
     /// Assembles the inner image. <paramref name="payloads"/> are, in on-disk order, the data files followed by
     /// the block-info table payload and the metadata block. Each payload is compressed per its flags and placed
     /// block-aligned or packed. Returns the block-aligned-tail on-disk image.

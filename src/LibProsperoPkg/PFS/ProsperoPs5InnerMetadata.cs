@@ -144,9 +144,19 @@ public sealed class ProsperoPs5InnerMetadata
     /// </summary>
     public byte[] Build(IReadOnlyList<ProsperoPs5MetaNode> inodes, long ndblock, IReadOnlyList<byte[]> blocks)
     {
-        int totalBlocks = 2 + blocks.Count;
+        ArgumentNullException.ThrowIfNull(inodes);
+        ArgumentNullException.ThrowIfNull(blocks);
+        if (inodes.Count > BlockSize / 0xA8)
+            throw new NotSupportedException("The inner inode table exceeds its reserved 64 KiB block.");
+        foreach (byte[] block in blocks)
+        {
+            ArgumentNullException.ThrowIfNull(block);
+            if (block.Length > BlockSize)
+                throw new NotSupportedException("An inner metadata table exceeds its reserved 64 KiB block.");
+        }
+        int totalBlocks = checked(2 + blocks.Count);
         // round the number of blocks up so the metadata region is a whole number of blocks
-        byte[] outBuf = new byte[totalBlocks * BlockSize];
+        byte[] outBuf = new byte[checked(totalBlocks * BlockSize)];
 
         BuildSuperblock(inodes.Count, ndblock).CopyTo(outBuf, 0);
 

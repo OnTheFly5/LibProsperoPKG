@@ -175,7 +175,7 @@ public static class ProsperoCompressedPfsFileWriter
     /// <summary>
     /// Streams a stored PFSv3 container for <paramref name="sourceLength"/> bytes read from
     /// <paramref name="source"/> into <paramref name="destination"/>, which must be seekable and
-    /// writable. Memory use is independent of the input length.
+    /// writable. Payload buffering is bounded; metadata grows with the number of blocks.
     /// </summary>
     public static void WriteStored(Stream destination, Stream source, long sourceLength,
         int level = 7, int blockSize = DefaultBlockSize)
@@ -209,9 +209,8 @@ public static class ProsperoCompressedPfsFileWriter
     /// <summary>
     /// Streams a Kraken-compressed PFSv3 container for <paramref name="sourceLength"/> bytes read from
     /// <paramref name="source"/> into <paramref name="destination"/>. The output is byte for byte what
-    /// the array overload produces, and memory use depends on the block size and the degree of
-    /// parallelism rather than on the input length, so an input of any size the format allows can be
-    /// packaged.
+    /// the array overload produces. Payload buffering depends on block size and parallelism;
+    /// metadata memory grows with the number of blocks.
     /// </summary>
     /// <param name="destination">Seekable, writable. The container is written at its current position.</param>
     /// <param name="source">Readable; read exactly once, front to back. Need not be seekable.</param>
@@ -228,19 +227,77 @@ public static class ProsperoCompressedPfsFileWriter
             compress: true, maxDegreeOfParallelism);
 
     /// <summary>
+    /// Emits a complete PFSC container with a zero-filled metadata prefix to an append-only stream.
+    /// After the sequential transfer completes, overwrite the container's reserved prefix with the
+    /// returned bytes. The prefix is relative to this container's start, not the output stream's start.
+    /// No destination reads, seeking, length queries, or position queries are performed.
+    /// </summary>
+    public static ProsperoPfscDeferredWrite WriteDeferred(Stream destination, Stream source,
+        long sourceLength, bool compress = true, int level = 7, int blockSize = DefaultBlockSize,
+        int maxDegreeOfParallelism = 1)
+        => Write(destination, source, sourceLength, level, blockSize, useHuffmanArrays: true,
+            compress, maxDegreeOfParallelism, deferPrefix: true);
+
+    // The nwonly inner image stores the PFSC payload blocks without the PFSC prefix.
+    // Share the exact encoder/store decision with the standalone container writer.
+    internal static ProsperoInnerPayloadResult WritePayload(Stream destination, Stream source,
+        long sourceLength, bool storeRaw, System.Threading.CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentOutOfRangeException.ThrowIfNegative(sourceLength);
+        if (!destination.CanWrite || !source.CanRead)
+            throw new ArgumentException("Readable input and writable output are required.");
+        var blocks = new System.Collections.Generic.List<ProsperoInnerPayloadBlock>();
+        var buffer = new byte[DefaultBlockSize];
+        long logical = 0, physical = 0;
+        Span<byte> digest = stackalloc byte[32];
+        Span<byte> signature = stackalloc byte[16];
+        // The standalone PFSC encoder represents an empty compressed file with one empty block.
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int count = (int)Math.Min(buffer.Length, sourceLength - logical);
+            int read = 0;
+            while (read < count)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                int n = source.Read(buffer, read, count - read);
+                if (n == 0) throw new EndOfStreamException("Source ended before its declared length.");
+                read += n;
+            }
+            var block = EncodeContainerBlock(buffer.AsSpan(0, count), !storeRaw,
+                useHuffmanArrays: true, digest, signature);
+            cancellationToken.ThrowIfCancellationRequested();
+            destination.Write(block.Payload);
+            blocks.Add(new ProsperoInnerPayloadBlock
+            {
+                OnDiskOffset = physical, LogicalOffset = logical,
+                CompressedSize = block.Payload.Length, UncompressedSize = count,
+                Flags = (byte)block.Flags, SizeHint = (int)block.SizeHint,
+                OnDiskDigest = ProsperoPfsDigest.ComputeBlockDigest(block.Payload),
+            });
+            physical = checked(physical + block.Payload.Length);
+            logical = checked(logical + count);
+        } while (logical < sourceLength);
+        return new ProsperoInnerPayloadResult { Length = physical, Blocks = blocks };
+    }
+
+    /// <summary>
     /// The one writer. Everything the layout needs is known from the logical length, so the metadata is
     /// reserved first, the blocks stream past in index order, and only the sentinel, the id=7 size, the
     /// total size and the file digest are written afterwards.
     /// </summary>
-    private static void Write(Stream destination, Stream source, long sourceLength, int level,
-        int blockSize, bool useHuffmanArrays, bool compress, int maxDegreeOfParallelism)
+    private static ProsperoPfscDeferredWrite Write(Stream destination, Stream source, long sourceLength, int level,
+        int blockSize, bool useHuffmanArrays, bool compress, int maxDegreeOfParallelism, bool deferPrefix = false)
     {
         ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(source);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
         ArgumentOutOfRangeException.ThrowIfNegative(sourceLength);
-        if (!destination.CanSeek || !destination.CanWrite)
-            throw new ArgumentException("Destination must be seekable and writable.", nameof(destination));
+        if (!destination.CanWrite || (!deferPrefix && !destination.CanSeek))
+            throw new ArgumentException("Destination must be writable, and seekable unless deferring its prefix.", nameof(destination));
+        if (!source.CanRead) throw new ArgumentException("Source must be readable.", nameof(source));
         if (!ProsperoPfsDigest.IsSupported)
             throw new PlatformNotSupportedException(
                 "SHA3-256 is required for the PS5 PFSv3 compression format but is not available on this host.");
@@ -255,8 +312,20 @@ public static class ProsperoCompressedPfsFileWriter
         var digests = new byte[checked((int)layout.Sec4Size)];
         var signatures = new byte[checked((int)layout.Sec5Size)];
 
-        long basePosition = destination.Position;
-        destination.Seek(basePosition + layout.Off7, SeekOrigin.Begin);
+        long basePosition = deferPrefix ? 0 : destination.Position;
+        if (deferPrefix)
+        {
+            Span<byte> zeros = stackalloc byte[4096];
+            zeros.Clear();
+            long remaining = layout.Off7;
+            while (remaining > 0)
+            {
+                int count = (int)Math.Min(remaining, zeros.Length);
+                destination.Write(zeros[..count]);
+                remaining -= count;
+            }
+        }
+        else destination.Seek(basePosition + layout.Off7, SeekOrigin.Begin);
 
         long cumulativeComp = 0;
         long cumulativeUncomp = 0;
@@ -358,10 +427,14 @@ public static class ProsperoCompressedPfsFileWriter
             span.Slice((int)layout.Off4, (int)layout.Sec4Size));
         digest.CopyTo(span[0x28..]);
 
-        long endPosition = destination.Position;
-        destination.Seek(basePosition, SeekOrigin.Begin);
-        destination.Write(prefix, 0, prefix.Length);
-        destination.Seek(endPosition, SeekOrigin.Begin);
+        if (!deferPrefix)
+        {
+            long endPosition = destination.Position;
+            destination.Seek(basePosition, SeekOrigin.Begin);
+            destination.Write(prefix, 0, prefix.Length);
+            destination.Seek(endPosition, SeekOrigin.Begin);
+        }
+        return new ProsperoPfscDeferredWrite { Length = totalSize, Prefix = prefix };
     }
 
     /// <summary>
