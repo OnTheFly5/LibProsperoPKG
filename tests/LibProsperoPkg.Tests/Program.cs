@@ -30,6 +30,7 @@ internal static class Program
 #endif
         StreamingTests.Run();
         NapsStreamingTests.Run();
+        OuterStreamingTests.Run();
 #if STREAMING_NATIVE_TESTS
         Console.WriteLine($"PASS {assertions} NativeAOT streaming regression assertions.");
 #else

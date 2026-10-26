@@ -64,6 +64,45 @@ Do not confuse this standalone PFSC facility with complete FPKG finalization:
 the current package path stores raw compression payloads and has additional
 layout, integrity and signing dependencies.
 
+## Data-first encrypted outer image
+
+`ProsperoOuterPfsBuilder.WriteForPackage` accepts an append-only destination,
+ordered `ProsperoOuterFileProducer` callbacks, fixed build parameters and EKPFS.
+Each callback writes one file synchronously; it need not know its compressed
+length in advance. Return the optional logical `SizeCompressed` inode value,
+or null to use the actual bytes written. Callbacks receive a forward-only
+stream, cannot seek or query its position, and must not retain it.
+
+The inner assembler can write directly to the first producer's stream. Retain
+its returned layout, then generate NAPS inside the second producer. This chain
+reads each inner source once and does not allocate the entire inner or outer
+image. It is covered by a byte-for-byte comparison with the buffered builders.
+
+The outer writer pads each file's last block (an empty file still owns one
+block), hashes the 64 KiB plaintext, and applies AES-XTS with the absolute
+image-relative sector index. Signed files and all structural metadata use
+bit 47 in the tweak; the superblock remains plaintext. Timestamps and seed are
+snapshotted before callbacks run. The destination may already contain a prefix.
+
+After payloads, it builds signed pointer blocks, inode table, directories, FLT
+and superblock. Direct, single and double-indirect addressing are supported:
+12 + 1,820 + 1,820² data blocks, or about 202 GiB per outer file. Higher levels
+are rejected explicitly. The legacy array builder is unchanged and retains
+its old limits. Supporting the mission's 400 GiB upper range needs additional
+addressing validation and implementation.
+
+`ProsperoOuterPfsStreamResult` contains sizes, block locations, superblock ICV
+and `GetBlockDigest(index)`, covering final plaintext blocks. Digest storage
+uses fixed-size pages (32 bytes per outer block, plus page slack), avoiding
+per-digest objects and a duplicate contiguous table. Payload buffering uses
+64 KiB; inode and directory sectors, pointer-node descriptors and digest pages
+are additional metadata memory. No image-tree XML or full FPKG is produced.
+
+A callback or output error aborts generation. A callback cannot suppress an
+output exception and turn a failed transfer into success: the sink retains
+and rethrows the failure, without retrying an encrypted block. Cancellation
+propagates, and the caller owns destination cleanup and `.part` publication.
+
 ## Ownership, resources, and limitations
 
 - Payload buffering is bounded by codec block/workspace size. The raw payload
@@ -83,8 +122,8 @@ layout, integrity and signing dependencies.
 - The current name codec is ASCII. Streaming source descriptors reject
   unsupported Unicode names and unrepresentable 40-bit sizes/offsets before
   opening payload readers rather than silently renaming/truncating them.
-- Outer filesystem addressing, SI generation, source overlays, full-package
-  hashing, no-Kraken package mode, and NativeAOT callback bindings remain to be
+- Higher-level outer filesystem addressing, SI generation, source overlays,
+  full-package hashing, no-Kraken package mode, and NativeAOT callback bindings remain to be
   integrated. No console or 100–400 GB package claim follows from these fixtures.
 
 ## NAPS and metadata inspection
@@ -130,12 +169,15 @@ read/write sizes, and synthetic-input allocation growth. NAPS regressions recove
 every file byte across mixed blocks, cursor wraps, long raw runs, and highly
 compressed input; check serialized lookup bases beyond 255 and sentinel groups;
 and walk 5,000-file/multi-sector metadata. Malformed metadata and field truncation
-have explicit failure regressions. Console compatibility remains unverified.
+have explicit failure regressions. Outer tests independently walk signed
+single/double pointers, decrypt sampled absolute sectors, check failure
+propagation and callback ownership, and check live-memory growth while writing
+a synthetic 115 MiB image to a sampling sink. Console compatibility remains unverified.
 
 
 The dedicated `tests/LibProsperoPkg.StreamingNativeTests` project links the same
 streaming regressions for NativeAOT, excluding the managed-only legacy XML
 comparison. See its README for publish/run commands. The managed suite passed
-6,250 assertions and the native streaming runner passed 5,960 on macOS arm64.
+13,764 assertions and the native streaming runner passed 13,474 on macOS arm64.
 The existing C ABI compatibility proof and independent 5,201 native SHA3 checks
 also passed. Linux and remote workflow results must be checked independently.

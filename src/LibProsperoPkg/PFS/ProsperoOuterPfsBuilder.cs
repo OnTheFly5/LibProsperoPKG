@@ -150,7 +150,7 @@ public sealed class ProsperoOuterPackageImage
 /// Assembles, signs, and encrypts the plaintext outer-PFS image of a PS5 nwonly finalized package.
 /// See the file header for the full byte layout.
 /// </summary>
-public static class ProsperoOuterPfsBuilder
+public static partial class ProsperoOuterPfsBuilder
 {
     /// <summary>The outer finalized-image PFS block size (one block = one AES-XTS data unit).</summary>
     public const int BlockSize = ProsperoOuterPfsImage.DefaultBlockSize; // 0x10000
