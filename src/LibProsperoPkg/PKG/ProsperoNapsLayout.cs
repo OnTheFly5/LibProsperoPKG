@@ -288,6 +288,11 @@ public static class ProsperoNapsLayout
     /// <summary>Encode section counts back into a 16-byte header (inverse of <see cref="DecodeHeader"/>).</summary>
     public static byte[] EncodeHeader(NapsLayoutCounts counts)
     {
+        if (counts.NumFiles is < 1 or > 0x1000000 || counts.NumKeys is < 1 or > 4
+            || counts.CompressionType > 3 || counts.NumShufflePatterns is < 0 or > 15
+            || counts.NumUBlocks is < 0 or > 0xffffff || counts.NumOuterBlocks is < 0 or > 0xffffff
+            || counts.NumCblockInfo is < 2 or > 0x1000001)
+            throw new ArgumentOutOfRangeException(nameof(counts), "NAPS header counts exceed packed field widths.");
         ulong word0 =
               ((ulong)(uint)(counts.NumFiles - 1) & 0xFFFFFF)
             | ((ulong)(counts.CompressionType & 0x3) << 24)
@@ -387,6 +392,8 @@ public static class ProsperoNapsLayout
     /// <summary>Encode a 6-byte fidx entry (inverse of <see cref="DecodeFileOffsetEntry"/>).</summary>
     public static byte[] EncodeFileOffsetEntry(NapsFileOffsetEntry entry)
     {
+        if (entry.UncompressedOffsetStart > 0xffffffffffUL)
+            throw new ArgumentOutOfRangeException(nameof(entry), "NAPS file offsets must fit 40 bits.");
         var buffer = new byte[FileOffsetStride];
         ulong offset = entry.UncompressedOffsetStart;
         for (int i = 0; i < 5; i++)
@@ -410,6 +417,8 @@ public static class ProsperoNapsLayout
     /// <summary>Encode a 10-byte u2c entry (inverse of <see cref="DecodeU2cEntry"/>).</summary>
     public static byte[] EncodeU2cEntry(NapsU2cEntry entry)
     {
+        if (entry.InfoOffset9BBase > 0xffffff)
+            throw new ArgumentOutOfRangeException(nameof(entry), "NAPS u2c base must fit 24 bits.");
         var buffer = new byte[U2cStride];
         buffer[0] = (byte)entry.InfoOffset9BBase;
         buffer[1] = (byte)(entry.InfoOffset9BBase >> 8);
@@ -482,6 +491,26 @@ public static class ProsperoNapsLayout
         // The fidx count is package-dependent (padding/metadata pseudo-entries), so derive it from the exact
         // blob length rather than assuming NumFiles+1 (which only holds for some packages, e.g. DebugSettings).
         int fidxCount = DeriveFidxEntryCount(counts, blob.Length);
+        // The generated nwonly profile terminates fidx with this explicit six-byte sentinel.
+        // Up to 15 alignment bytes can otherwise look like extra fidx entries (notably 6/12 bytes).
+        ReadOnlySpan<byte> sentinel = [0x01, 0x00, 0x00, 0x05, 0x06, 0x07];
+        long fidxStart = HeaderSize + (long)counts.NumOuterBlocks * OuterBlockDigestStride
+            + (long)counts.NumShufflePatterns * ShufflePatternStride;
+        long following = (long)counts.NumU2cEntries * U2cStride
+            + (long)counts.NumCblockInfo * CblockInfoStride;
+        for (int padding = 0; padding < DefaultAlignment && padding <= blob.Length; padding++)
+        {
+            if (blob.Slice(blob.Length - padding).IndexOfAnyExcept((byte)0) >= 0) continue;
+            long fidxBytes = blob.Length - padding - following - fidxStart;
+            if (fidxBytes < FileOffsetStride || fidxBytes % FileOffsetStride != 0) continue;
+            long last = fidxStart + fidxBytes - FileOffsetStride;
+            if (last < 0 || last > blob.Length - FileOffsetStride) continue;
+            if (blob.Slice((int)last, FileOffsetStride).SequenceEqual(sentinel))
+            {
+                fidxCount = checked((int)(fidxBytes / FileOffsetStride));
+                break;
+            }
+        }
         return Parse(blob, counts, fidxCount);
     }
 
@@ -638,6 +667,13 @@ public static class ProsperoNapsLayout
     /// </summary>
     public static byte[] EncodeCblockInfoEntry(NapsCblockInfoEntry entry)
     {
+        if (entry.IsRunBase
+            ? entry.CoffsetEndMod256K > 0x3ffff || entry.TweakIdxStart > 0xfffffff
+                || entry.KeyTableIdx > 3 || entry.CoffsetStart256K > 0xffffff
+            : entry.CoffsetStartMod256K > 0x3ffff || entry.UoffsetStart > 0x3ffff
+                || entry.ClenEvenMinus1 > 0x1ffff || entry.Even > 1 || entry.Odd > 1
+                || entry.KdePredictor > 7 || entry.ShuffleIdx > 15)
+            throw new ArgumentOutOfRangeException(nameof(entry), "NAPS cblock fields exceed packed widths.");
         ulong lo = (entry.IsRunBase ? entry.CoffsetEndMod256K : entry.CoffsetStartMod256K) & 0x3FFFF;
         ulong hi;
         if (!entry.IsRunBase)

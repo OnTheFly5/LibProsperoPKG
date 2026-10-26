@@ -27,15 +27,27 @@ public static class ProsperoNwonlyNapsGenerator
     /// schedule is known.
     /// </summary>
     public static byte[] Generate(ProsperoPs5InnerImageResult result, IReadOnlyCollection<long>? runOverride = null)
+        => Generate((ProsperoPs5InnerImageLayout)result, runOverride);
+
+    /// <summary>
+    /// Builds NAPS from captured streamed geometry and codec records without reading the inner image.
+    /// This models the current nwonly profile; it does not establish console acceptance.
+    /// </summary>
+    public static byte[] Generate(ProsperoPs5InnerImageLayout result, IReadOnlyCollection<long>? runOverride = null)
     {
         ArgumentNullException.ThrowIfNull(result);
         var placements = result.Placements;
+        bool captured = result.FileBlocks.Count != 0;
+        if (captured && result.FileBlocks.Count != placements.Count)
+            throw new ArgumentException("Codec records must cover every placed file.", nameof(result));
+        if (!captured && result is not ProsperoPs5InnerImageResult && placements.Any(p => !p.StoreRaw))
+            throw new ArgumentException("Streamed compressed files require captured codec records.", nameof(result));
         long mountSize = result.Ndblock * Block64K;
         long metaBase = result.MetaBaseLogical;
         long dataEnd = result.DataEndLogical;
 
         // ---- DATA-region placements + derivable run schedule ----------------------------------------
-        var files = placements.Select(p => new NapsFilePlacement
+        var files = placements.Select((p, i) => new NapsFilePlacement
         {
             OnDiskOffset = p.OnDiskOffset,
             LogicalOffset = p.LogicalOffset,
@@ -43,6 +55,7 @@ public static class ProsperoNwonlyNapsGenerator
             UncompressedSize = p.UncompressedSize,
             StoreRaw = p.StoreRaw,
             CompressedKde = 2,
+            Blocks = captured ? result.FileBlocks[i] : null,
         }).ToList();
 
         HashSet<long> runSet;
@@ -118,12 +131,13 @@ public static class ProsperoNwonlyNapsGenerator
                 b.CompressedSize, b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
         }
         long metaOnDisk = result.MetadataOnDiskOffset;
-        bool metaCompressed = result.CompressedMetadata.Length < result.MetadataPlaintext.Length;
         long metaCursor = metaOnDisk;
         int metaCount = metaChunks.Count;
         for (int i = 0; i < metaCount; i++)
         {
             var blk = metaChunks[i];
+            bool metaCompressed = blk.CompressedSize != blk.UncompressedSize;
+            bool fullStored = !metaCompressed && blk.UncompressedSize == Ublock256K;
             int even = blk.IsMultiChunk ? blk.FirstChunkCompressedSize : blk.CompressedSize;
             tail.Add(new NapsCblockPlanEntry
             {
@@ -133,11 +147,11 @@ public static class ProsperoNwonlyNapsGenerator
                 StartRun = i == 0,
                 OnDiskOffset = metaCursor,
                 LogicalOffset = metaBase + (long)i * Ublock256K,
-                EvenChunkCompressedLength = metaCompressed ? even : blk.UncompressedSize,
-                StreamLength = blk.CompressedSize,
-                Even = 0,
+                EvenChunkCompressedLength = metaCompressed ? even : (fullStored ? 0x10000 : blk.UncompressedSize),
+                StreamLength = fullStored ? 0x80000 : blk.CompressedSize,
+                Even = (byte)(fullStored ? 1 : 0),
                 Odd = 1,
-                KdePredictor = (byte)(metaCompressed ? 2 : 4),
+                KdePredictor = (byte)(metaCompressed ? 2 : (fullStored ? 4 : 0)),
                 ShuffleIndex = (byte)(metaCompressed && i < metaCount - 1 ? 2 : 0),
             });
             metaCursor += blk.CompressedSize;
@@ -152,8 +166,10 @@ public static class ProsperoNwonlyNapsGenerator
         fidx.Add(metaBase);
         fidx.Add(mountSize);
 
-        int numUBlocks = (int)((mountSize + Ublock256K - 1) / Ublock256K);
-        int numOuterBlocks = (result.Image.Length + Block64K - 1) / Block64K;
+        int numUBlocks = checked((int)(checked(mountSize + Ublock256K - 1) / Ublock256K));
+        long length = result is ProsperoPs5InnerImageResult buffered ? buffered.Image.LongLength : result.OutputLength;
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        int numOuterBlocks = checked((int)(checked(length + Block64K - 1) / Block64K));
 
         var doc = ProsperoNapsLayoutBuilder.BuildFromInnerImage(
             numUBlocks: numUBlocks,

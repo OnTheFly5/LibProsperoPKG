@@ -21,10 +21,19 @@ internal static class Program
 
     private static void Main()
     {
+#if !STREAMING_NATIVE_TESTS
+        // The GP5 parity reference intentionally uses the legacy dynamic XML serializer.
+        // It belongs to the managed suite; the native streaming runner links only streaming tests.
         HashTests.Run();
         Gp5Tests.Run();
         AotHelpersTests.Run();
+#endif
         StreamingTests.Run();
+        NapsStreamingTests.Run();
+#if STREAMING_NATIVE_TESTS
+        Console.WriteLine($"PASS {assertions} NativeAOT streaming regression assertions.");
+#else
         Console.WriteLine($"PASS {assertions} SHA3/GP5/AOT/streaming regression assertions.");
+#endif
     }
 }

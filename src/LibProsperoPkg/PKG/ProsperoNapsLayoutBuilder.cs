@@ -7,6 +7,7 @@
 // u2c, fidx, and header sections from the modeled fields.
 // ---------------------------------------------------------------------------------------------------
 #nullable enable
+using LibProsperoPkg.PFS;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -98,7 +99,8 @@ public sealed class NapsGenerationRequest
 /// One placed DATA-region file, as laid out by <c>ProsperoPs5InnerImageAssembler</c>. The naps builder
 /// derives this file's CblockInfo blocks from its geometry: a raw file becomes
 /// <c>floor(UncompressedSize/0x40000)</c> full 256 KiB blocks plus a tail block; a compressed file
-/// becomes a single block. Whether each block opens a new RUN base is decided by the flush schedule
+/// falls back to a single block when captured <see cref="NapsFilePlacement.Blocks"/> are absent.
+/// Captured records preserve actual per-block stored/Kraken decisions. Whether each block opens a new RUN base is decided by the flush schedule
 /// (<c>runStartOnDiskOffsets</c>), which is a compressor artifact and is supplied separately.
 /// </summary>
 public sealed class NapsFilePlacement
@@ -120,6 +122,9 @@ public sealed class NapsFilePlacement
 
     /// <summary>KDE predictor for a compressed file's block (default 2 = Kraken).</summary>
     public byte CompressedKde { get; init; } = 2;
+
+    /// <summary>Optional captured codec blocks, relative to this file. Required for streamed compressed files.</summary>
+    public IReadOnlyList<ProsperoInnerPayloadBlock>? Blocks { get; init; }
 }
 
 /// <summary>
@@ -173,6 +178,7 @@ public static class ProsperoNapsLayoutBuilder
             NumOuterBlocks: request.NumOuterBlocks,
             NumCblockInfo: cblockInfos.Count);
 
+        _ = ProsperoNapsLayout.EncodeHeader(counts); // Validate representability before allocating section tables.
         List<NapsFileOffsetEntry> fileOffsets = BuildFileOffsets(request);
         List<NapsU2cEntry> u2c = BuildU2c(stdLogical, counts.NumUBlocks, counts.NumCblockInfo, counts.NumU2cEntries);
 
@@ -220,6 +226,13 @@ public static class ProsperoNapsLayoutBuilder
 
         foreach (NapsFilePlacement f in files)
         {
+            if (f.Blocks is not null)
+            {
+                AppendRecordedBlocks(f, runSet, blocks);
+                continue;
+            }
+            if (f.UncompressedSize == 0)
+                continue;
             if (f.StoreRaw)
             {
                 long full = f.UncompressedSize / UBlock;
@@ -277,6 +290,58 @@ public static class ProsperoNapsLayoutBuilder
         return blocks;
     }
 
+    private static void AppendRecordedBlocks(NapsFilePlacement file, HashSet<long> runSet,
+        List<NapsCblockPlanEntry> result)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(file.OnDiskOffset);
+        ArgumentOutOfRangeException.ThrowIfNegative(file.LogicalOffset);
+        ArgumentOutOfRangeException.ThrowIfNegative(file.OnDiskSize);
+        ArgumentOutOfRangeException.ThrowIfNegative(file.UncompressedSize);
+        long physical = 0, logical = 0;
+        for (int index = 0; index < file.Blocks!.Count; index++)
+        {
+            var block = file.Blocks[index];
+            if (index + 1 < file.Blocks.Count && block.UncompressedSize != UBlock)
+                throw new ArgumentException("Only the final codec block may be partial.", nameof(file));
+            if (block.OnDiskOffset != physical || block.LogicalOffset != logical
+                || block.UncompressedSize < 0 || block.UncompressedSize > UBlock
+                || block.CompressedSize < 0 || block.CompressedSize > block.UncompressedSize)
+                throw new ArgumentException("Captured file blocks have invalid offsets or sizes.", nameof(file));
+            if (block.UncompressedSize == 0)
+            {
+                if (file.UncompressedSize != 0 || file.Blocks.Count != 1)
+                    throw new ArgumentException("An empty block must describe an empty file.", nameof(file));
+                continue;
+            }
+            if (block.CompressedSize == 0 || (file.StoreRaw && !block.IsStored))
+                throw new ArgumentException("Captured block contradicts the file storage policy.", nameof(file));
+            bool fullStored = block.IsStored && block.UncompressedSize == UBlock;
+            if (!block.IsStored && (block.FirstChunkCompressedSize <= 0
+                || (block.IsMultiChunk ? block.FirstChunkCompressedSize >= block.CompressedSize
+                    : block.FirstChunkCompressedSize != block.CompressedSize)))
+                throw new ArgumentException("Invalid compressed subchunk length.", nameof(file));
+            long onDisk = checked(file.OnDiskOffset + physical);
+            result.Add(new NapsCblockPlanEntry
+            {
+                StartRun = runSet.Contains(onDisk),
+                OnDiskOffset = onDisk,
+                LogicalOffset = checked(file.LogicalOffset + logical),
+                EvenChunkCompressedLength = block.IsStored
+                    ? (fullStored ? 0x10000 : block.UncompressedSize)
+                    : (block.IsMultiChunk ? block.FirstChunkCompressedSize : block.CompressedSize),
+                // Full raw blocks advance the encoded cursor twice their physical length.
+                StreamLength = fullStored ? 0x80000 : block.CompressedSize,
+                Even = (byte)(fullStored ? 1 : 0), Odd = 1,
+                KdePredictor = (byte)(block.IsStored ? (fullStored ? 4 : 0) : file.CompressedKde),
+                ShuffleIndex = 0,
+            });
+            physical = checked(physical + block.CompressedSize);
+            logical = checked(logical + block.UncompressedSize);
+        }
+        if (physical != file.OnDiskSize || logical != file.UncompressedSize)
+            throw new ArgumentException("Captured blocks do not cover the placed file.", nameof(file));
+    }
+
     /// <summary>
     /// Build a <c>naps_pkg_layout.dat</c> document from a built inner image: derive the DATA-region blocks
     /// from <paramref name="files"/> + the flush schedule, append the compressor-derived
@@ -326,8 +391,13 @@ public static class ProsperoNapsLayoutBuilder
 
         foreach (NapsCblockPlanEntry blk in blocks)
         {
+            if (blk.OnDiskOffset < 0 || blk.LogicalOffset < 0 || blk.StreamLength < 0
+                || (!blk.Terminator && (blk.EvenChunkCompressedLength <= 0 || blk.StreamLength == 0)))
+                throw new ArgumentException("Invalid NAPS block geometry.", nameof(blocks));
             if (blk.StartRun)
             {
+                if (blk.OnDiskOffset / UBlock > 0x7fffff || (!blk.Terminator && (blk.OnDiskOffset >> 15) > 0xfffffff))
+                    throw new NotSupportedException("NAPS run offset exceeds its packed fields.");
                 uint coffEnd = (uint)(cursor & Mod256K);
                 long baseC = 2 * (blk.OnDiskOffset / UBlock) * UBlock;
                 long rem = blk.OnDiskOffset % UBlock;
@@ -366,7 +436,7 @@ public static class ProsperoNapsLayoutBuilder
             });
             stdLogical.Add((stdIndex, blk.LogicalOffset));
 
-            cursor += blk.StreamLength;
+            cursor = checked(cursor + blk.StreamLength);
         }
 
         return (entries, stdLogical);
@@ -426,23 +496,14 @@ public static class ProsperoNapsLayoutBuilder
         var u2c = new List<NapsU2cEntry>(numGroups);
         for (int g = 0; g < numGroups; g++)
         {
-            var entry = new byte[ProsperoNapsLayout.U2cStride];
-            int baseG = first[8 * g];
-            bool hasNext = 8 * g + 8 < numUBlocks;
-            int nextBase = hasNext ? first[8 * g + 8] : 0;
-
-            // bytes[0..3] = 2nd-half deltas of group g (ublocks 8g+4 .. 8g+7) from baseG.
-            for (int j = 0; j < 4; j++)
-                entry[j] = ToU2cByte(Delta(8 * g + 4 + j, baseG), "delta");
-
-            entry[4] = ToU2cByte(nextBase, "next-base");        // base of the next group
-            // bytes[5..6] are always zero.
-
-            // bytes[7..9] = the next group's first-three deltas (ublocks 8g+9 .. 8g+11) from nextBase.
-            for (int j = 0; j < 3; j++)
-                entry[7 + j] = hasNext ? ToU2cByte(Delta(8 * g + 9 + j, nextBase), "delta") : (byte)0;
-
-            u2c.Add(ProsperoNapsLayout.DecodeU2cEntry(entry));
+            int firstUblock = checked(8 * g);
+            int baseIndex = firstUblock < numUBlocks ? first[firstUblock] : numCblockInfo - 1;
+            if (baseIndex < 0 || baseIndex > 0xffffff)
+                throw new NotSupportedException("NAPS u2c base exceeds its 24-bit field.");
+            var deltas = new byte[7];
+            for (int j = 1; j < 8; j++)
+                deltas[j - 1] = ToU2cByte(Delta(firstUblock + j, baseIndex), "delta");
+            u2c.Add(new NapsU2cEntry((uint)baseIndex, deltas));
         }
 
         return u2c;

@@ -151,6 +151,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         public ProsperoPs5InnerFileSource? Source;
         public long Length => Source?.Length ?? Data.LongLength;
         public long StreamedLength;
+        public IReadOnlyList<ProsperoInnerPayloadBlock> CodecBlocks = Array.Empty<ProsperoInnerPayloadBlock>();
         public long OnDiskLength => OnDiskData?.LongLength ?? StreamedLength;
         public Dir Parent = null!;
         public uint Inode;
@@ -237,18 +238,14 @@ public sealed class ProsperoPs5InnerImageAssembler
             // An unsigned executable image is meant to become a signed module before it reaches the
             // image; the caller owns that conversion. Reaching here with one is not an error, so it is
             // stored as it stands rather than failing a build that would otherwise succeed.
-            if (policy == ProsperoInnerFilePolicy.StoreVerbatim
-                || policy == ProsperoInnerFilePolicy.RequiresModuleConversion)
-            {
-                f.StoreRaw = true;
-                f.OnDiskData = f.Data;
-            }
-            else
-            {
-                byte[] comp = ProsperoPs5InnerImageBuilder.CompressPayload(f.Data, storeRaw: false);
-                f.StoreRaw = ReferenceEquals(comp, f.Data);
-                f.OnDiskData = comp;
-            }
+            f.StoreRaw = f.Length == 0 || policy is ProsperoInnerFilePolicy.StoreVerbatim
+                or ProsperoInnerFilePolicy.RequiresModuleConversion;
+            using var input = new MemoryStream(f.Data, writable: false);
+            using var encoded = new MemoryStream();
+            var payload = ProsperoPs5InnerImageBuilder.WritePayload(
+                f.StoreRaw ? Stream.Null : encoded, input, f.Length, f.StoreRaw);
+            f.CodecBlocks = payload.Blocks;
+            f.OnDiskData = f.StoreRaw ? f.Data : encoded.ToArray();
             f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
             f.WholeBlockRaw = IsKeystone(f.FullPath);
         }
@@ -256,7 +253,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         // Data-region block count = the on-disk block index of the block-info table (the block-aligned end of
         // the packed data files). Raw files are block-aligned, compressed files are packed; this mirrors
         // ProsperoPs5InnerImageBuilder.Build exactly.
-        long dataBlocks = ComputeDataRegionBlocks(afidOrder);
+        long dataBlocks = ComputeMetadataAnchorBlocks(afidOrder);
 
         // Pad dataBlocks up so that `metaBase = (dataBlocks + 63) * BlockSize` and the inner sblock at
         // `(dataBlocks + 61) * BlockSize` land on U-block boundaries (= 4 * BlockSize = 0x40000). This is
@@ -299,6 +296,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         {
             Image = image,
             OutputLength = image.LongLength,
+            FileBlocks = afidOrder.Select(f => f.CodecBlocks).ToArray(),
             MetadataPlaintext = metaPlain,
             Nodes = nodes,
             Ndblock = ndblock,
@@ -328,13 +326,19 @@ public sealed class ProsperoPs5InnerImageAssembler
         if (files.Count == 0) throw new ArgumentException("At least one file is required.", nameof(files));
         var sources = new Dictionary<string, ProsperoPs5InnerFileSource>(StringComparer.Ordinal);
         var headers = new List<ProsperoPs5InnerFile>();
+        long declaredLogicalEnd = 0;
         foreach (var file in files)
         {
             ArgumentNullException.ThrowIfNull(file);
             ArgumentOutOfRangeException.ThrowIfNegative(file.Length);
+            if (file.Length > 0xffffffffffL || declaredLogicalEnd > 0xffffffffffL - file.Length)
+                throw new NotSupportedException("Source file sizes and logical offsets must fit the 40-bit metadata fields.");
+            declaredLogicalEnd += file.Length;
             ArgumentNullException.ThrowIfNull(file.OpenRead);
             string path = file.Path?.TrimStart('/') ?? "";
-            if (path.Length == 0 || path.Split('/').Any(p => p.Length == 0 || p == "." || p == "..")
+            if (path.Any(c => c > 0x7f))
+                throw new NotSupportedException("Non-ASCII PFS names are not supported by the current dirent codec.");
+            if (path.Length == 0 || path.Split('/').Any(p => p.Length == 0 || p.Length > 255 || p == "." || p == "..")
                 || path.Any(c => char.IsControl(c) || c == '\\') || !sources.TryAdd("/" + path, file))
                 throw new ArgumentException("Invalid or duplicate inner file path: " + file.Path, nameof(files));
             headers.Add(new ProsperoPs5InnerFile { Path = path, Data = Array.Empty<byte>(), Policy = file.Policy });
@@ -347,15 +351,10 @@ public sealed class ProsperoPs5InnerImageAssembler
         Dir uroot = BuildTree(headers);
         var (dirsPreOrder, fileNodes, afidOrder, superRootInode,
             inodeFltInode, aprFltInode, afidTableInode) = PrepareTree(uroot);
-        // Current metadata format reserves one block for inodes and for each table/directory.
-        // Fail before opening any payload instead of overwriting adjacent metadata blocks.
-        if (4L + dirsPreOrder.Count + fileNodes.Count > BlockSize / 0xA8)
-            throw new NotSupportedException("Current inner metadata supports at most 390 inode records.");
         BuildDirents(uroot);
-        if (dirsPreOrder.Any(d => DirentBytes(d.Dirents).Length > BlockSize)
-            || ProsperoPs5FlatPathTable.HeaderSize + 16L * (dirsPreOrder.Count - 1 + fileNodes.Count) > BlockSize
-            || 4L * (fileNodes.Count + 3) > BlockSize)
-            throw new NotSupportedException("Current inner metadata tables must each fit one 64 KiB block.");
+        // Validate metadata geometry/representability before opening any source payload.
+        _ = BuildNodes(uroot, dirsPreOrder, fileNodes, 3,
+            superRootInode, inodeFltInode, aprFltInode, afidTableInode, out _);
         var afidOffsets = new long[afidOrder.Count];
         var fileBlocks = new List<IReadOnlyList<ProsperoInnerPayloadBlock>>();
         long logical = 0, physical = 0;
@@ -385,11 +384,12 @@ public sealed class ProsperoPs5InnerImageAssembler
             // Source growth is not silently ignored: declared length is part of layout/integrity.
             if (source.ReadByte() != -1) throw new InvalidDataException("Source grew: " + f.FullPath);
             f.StreamedLength = result.Length;
+            f.CodecBlocks = result.Blocks;
             fileBlocks.Add(result.Blocks);
             physical = checked(physical + result.Length);
             if (f.WholeBlockRaw) PadToBlock(destination, ref physical, cancellationToken);
         }
-        long dataBlocks = ComputeDataRegionBlocks(afidOrder);
+        long dataBlocks = ComputeMetadataAnchorBlocks(afidOrder);
         while ((dataBlocks + 61) % 4 != 0) dataBlocks++;
         BuildDirents(uroot);
         var nodes = BuildNodes(uroot, dirsPreOrder, fileNodes, dataBlocks,
@@ -628,10 +628,21 @@ public sealed class ProsperoPs5InnerImageAssembler
         // Resolve each child's byte offset within this dirent block.
         int off = 0;
         var byName = new Dictionary<string, int>(StringComparer.Ordinal);
+        ProsperoPfsDirent? previous = null;
         foreach (var e in dir.Dirents)
         {
+            int remaining = BlockSize - off % BlockSize;
+            if (e.EntSize > remaining)
+            {
+                // Extend the preceding entry's zero tail to the sector boundary. A directory
+                // reader must never need to load two sectors to decode one entry.
+                if (previous is null) throw new InvalidOperationException("Directory entry exceeds a sector.");
+                previous.EntSize = checked(previous.EntSize + remaining);
+                off = checked(off + remaining);
+            }
             byName[e.Name] = off;
-            off += e.EntSize;
+            off = checked(off + e.EntSize);
+            previous = e;
         }
         foreach (var d in dir.SubDirs)
             d.DirentOffsetInParent = byName[d.Name];
@@ -652,14 +663,24 @@ public sealed class ProsperoPs5InnerImageAssembler
         // super-root dirents, the inode/apr flat-path tables, the afid table, then every directory's
         // dirent block (uroot, sub-directories in pre-order). Their logical offsets are consecutive
         // 64 KiB blocks starting at the metadata-region base.
-        int metadataContentBlocks = 1 /*super-root dirents*/ + 3 /*flt/apr/afid*/ + dirsPreOrder.Count /*dir dirents*/ + 1 /*trailing*/;
+        int inodeFltBlocks = ProsperoPs5InnerMetadata.BlocksForBytes(
+            checked(ProsperoPs5FlatPathTable.HeaderSize + 16L * (dirsPreOrder.Count - 1 + fileNodes.Count)));
+        int aprFltBlocks = ProsperoPs5InnerMetadata.BlocksForBytes(
+            checked(ProsperoPs5FlatPathTable.HeaderSize + 16L * fileNodes.Count(f => !f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal))));
+        int afidBlocks = ProsperoPs5InnerMetadata.BlocksForBytes(checked(4L * (fileNodes.Count + 3L)));
+        var directoryBlocks = dirsPreOrder.ToDictionary(d => d,
+            d => ProsperoPs5InnerMetadata.BlocksForBytes(DirentBytes(d.Dirents).LongLength));
+        int metadataContentBlocks = checked(1 + inodeFltBlocks + aprFltBlocks + afidBlocks
+            + directoryBlocks.Values.Sum() + 1);
         // PFSv3 mount geometry: after the on-disk data region (dataBlocks = the block-aligned end of
         // the packed data files, i.e. the block-info table's block index) the mount leaves a fixed 61-block
         // reserve, then the metadata plaintext (superblock + inode table + content blocks). The super-root
         // dirents block (metaBase) is the third metadata block, so metaBase = dataBlocks + 61 + 2. Ndblock is
         // the end of the metadata region = metaBase + metadataContentBlocks.
         const long MetadataReserveBlocks = 61;
-        long metaBaseBlock = dataBlocks + MetadataReserveBlocks + 2;
+        int inodeBlocks = ProsperoPs5InnerMetadata.InodeBlockCount(
+            checked(4 + dirsPreOrder.Count + fileNodes.Count));
+        long metaBaseBlock = checked(dataBlocks + MetadataReserveBlocks + 1 + inodeBlocks);
         long metaBase = metaBaseBlock * BlockSize;
         ndblock = metaBaseBlock + metadataContentBlocks;
 
@@ -685,9 +706,9 @@ public sealed class ProsperoPs5InnerImageAssembler
         // inodes 1..3: the internal metadata files (flat-path tables + afid table). Sizes are filled in
         // by BuildMetadataPlaintext; here we only need the logical offsets + inode fields. The names are the
         // fixed PFS-internal identifiers (used for the pfsimage.xml introspection; not written as dirents).
-        nodes.Add(MetaFileNode(inodeFltInode, (ulong)b, 0x00020010, "inode_flat_path_table")); b += BlockSize;
-        nodes.Add(MetaFileNode(aprFltInode, (ulong)b, 0x00020010, "apr_flat_path_table")); b += BlockSize;
-        nodes.Add(MetaFileNode(afidTableInode, (ulong)b, 0x00020010, "afid_to_ino_table")); b += BlockSize;
+        nodes.Add(MetaFileNode(inodeFltInode, (ulong)b, 0x00020010, "inode_flat_path_table")); b = checked(b + (long)inodeFltBlocks * BlockSize);
+        nodes.Add(MetaFileNode(aprFltInode, (ulong)b, 0x00020010, "apr_flat_path_table")); b = checked(b + (long)aprFltBlocks * BlockSize);
+        nodes.Add(MetaFileNode(afidTableInode, (ulong)b, 0x00020010, "afid_to_ino_table")); b = checked(b + (long)afidBlocks * BlockSize);
 
         // inode 4: uroot; then sub-directories pre-order.
         foreach (var d in dirsPreOrder)
@@ -701,12 +722,12 @@ public sealed class ProsperoPs5InnerImageAssembler
                 Mode = (ushort)(isUroot ? 0x416d : 0x4168),
                 Nlink = (ushort)(2 + d.SubDirs.Count + (isUroot ? 1 : 0)),
                 Flags = (uint)(isUroot ? 0x00000010 : 0x00020010),
-                Size = BlockSize,
+                Size = (long)directoryBlocks[d] * BlockSize,
                 LogicalOffset = (ulong)b,
                 ParentInode = isUroot ? -1 : (int)d.Parent!.Inode,
                 DirentOffset = isUroot ? -1 : d.DirentOffsetInParent,
             });
-            b += BlockSize;
+            b = checked(b + (long)directoryBlocks[d] * BlockSize);
         }
 
         // Regular files (inode order = fileNodes order).
@@ -836,6 +857,22 @@ public sealed class ProsperoPs5InnerImageAssembler
     /// Computes the on-disk block index of the block-info table = the block-aligned end of the packed data
     /// files (raw files block-aligned, compressed files packed), matching ProsperoPs5InnerImageBuilder.Build.
     /// </summary>
+    private static long ComputeMetadataAnchorBlocks(List<FileNode> files)
+    {
+        long anchor = ComputeDataRegionBlocks(files);
+        while ((anchor + 61) % 4 != 0) anchor++;
+        long logicalEnd = files.Count == 0 ? 0 : checked(files[^1].LogicalOffset + files[^1].Length);
+        // Preserve existing layouts while they fit. Highly compressible inputs can have a logical
+        // data end beyond the old physical-length-based metadata address; leave a full logical
+        // U-block of zero padding and move metadata, without adding physical output bytes.
+        if (logicalEnd >= checked((anchor + 61) * BlockSize))
+        {
+            anchor = checked((logicalEnd + BlockSize - 1) / BlockSize + 4 - 61);
+            while ((anchor + 61) % 4 != 0) anchor++;
+        }
+        return anchor;
+    }
+
     private static long ComputeDataRegionBlocks(List<FileNode> afidOrder)
     {
         long pos = 0;

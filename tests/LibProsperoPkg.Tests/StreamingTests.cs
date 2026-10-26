@@ -175,23 +175,42 @@ internal static class StreamingTests
         };
         foreach (string path in new[] { "", "/", "../bad", "x/../bad", "a//b", "a\\b" })
             Program.Throws<ArgumentException>(() => assembler.Write(Stream.Null, [Source(path)]));
+        Program.Throws<NotSupportedException>(() => assembler.Write(Stream.Null,
+            [Source("café"), Source("cafè")]));
         Program.Throws<ArgumentException>(() => assembler.Write(Stream.Null, [Source("a"), Source("/a")]));
         Program.Throws<ArgumentException>(() => assembler.Write(Stream.Null, [Source("a"), Source("a/b")]));
         Program.Throws<ArgumentOutOfRangeException>(() => assembler.Write(Stream.Null, [Source("a", -1)]));
         Program.Throws<EndOfStreamException>(() => assembler.Write(Stream.Null, [Source("a", 2)]));
         Program.Throws<InvalidDataException>(() => assembler.Write(Stream.Null, [Source("a", 1, [1, 2])]));
+        int oversizedOpens = 0;
+        var oversized = new ProsperoPs5InnerFileSource
+        {
+            Path = "/large", Length = 1L << 40,
+            OpenRead = () => { oversizedOpens++; return Stream.Null; },
+        };
+        Program.Throws<NotSupportedException>(() => assembler.Write(Stream.Null, [oversized]));
+        Program.Equal(0, oversizedOpens, "unrepresentable file size rejected before source opens");
         int opened = 0;
         var excessive = Enumerable.Range(0, 400).Select(i => new ProsperoPs5InnerFileSource
         {
-            Path = "/f" + i, Length = 1,
+            Path = "/" + new string('x', 200) + i, Length = 1,
             OpenRead = () => { opened++; return new MemoryStream([1]); },
         }).ToArray();
-        Program.Throws<NotSupportedException>(() => assembler.Write(Stream.Null, excessive));
-        Program.Equal(0, opened, "metadata capacity checked before opening payloads");
+        var wideDirectory = assembler.Write(Stream.Null, excessive);
+        Program.Equal(400, opened, "wide-directory source streams each open once");
+        Program.Equal(true, wideDirectory.Nodes.Any(n => n.IsDirectory && n.Size > 0x10000),
+            "wide directory spans more than one sector");
         var metadata = new ProsperoPs5InnerMetadata(1, 0);
-        Program.Throws<NotSupportedException>(() => metadata.Build(
-            Enumerable.Range(0, 391).Select(_ => new ProsperoPs5MetaNode()).ToArray(), 1, []));
-        Program.Throws<NotSupportedException>(() => metadata.Build([], 1, [new byte[0x10001]]));
+        byte[] inodeImage = metadata.Build(
+            Enumerable.Range(0, 391).Select(i => new ProsperoPs5MetaNode { Size = i }).ToArray(), 1, []);
+        Program.Equal(3 * 0x10000, inodeImage.Length, "391 inodes occupy two complete inode sectors");
+        Program.Equal(390L, System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
+            inodeImage.AsSpan(2 * 0x10000 + 8)), "inode after first sector boundary preserved");
+        var wideTable = new byte[0x10001];
+        wideTable[^1] = 0x5a;
+        byte[] tableImage = metadata.Build([], 1, [wideTable]);
+        Program.Equal(4 * 0x10000, tableImage.Length, "oversized table reserves complete sectors");
+        Program.Equal((byte)0x5a, tableImage[3 * 0x10000], "table tail remains intact");
         using var cancelled = new CancellationTokenSource();
         cancelled.Cancel();
         Program.Throws<OperationCanceledException>(() => assembler.Write(Stream.Null, [Source("a")], cancelled.Token));
@@ -203,7 +222,9 @@ internal static class StreamingTests
             Path = "/large-compressible", Length = 8L * 1024 * 1024,
             OpenRead = () => new GeneratedReader(8L * 1024 * 1024),
         };
-        Program.Throws<NotSupportedException>(() => assembler.Write(Stream.Null, [compressible]));
+        var compressedLayout = assembler.Write(Stream.Null, [compressible]);
+        Program.Equal(true, compressedLayout.MetaBaseLogical > compressible.Length,
+            "highly compressed data does not overlap metadata");
         using var healthy = new MemoryStream(new byte[1]);
         Program.Throws<IOException>(() => ProsperoPs5InnerImageBuilder.WritePayload(new BrokenWriter(), healthy, 1));
     }

@@ -1,0 +1,47 @@
+name: Library regressions
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regressions-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rid: linux-x64
+          - runner: macos-14
+            rid: osx-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Native build prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang zlib1g-dev libssl-dev
+      - name: Managed regressions
+        run: >-
+          dotnet run --project tests/LibProsperoPkg.Tests/LibProsperoPkg.Tests.csproj
+          -c Release --artifacts-path .TestArtifacts/Managed
+          -p:UseSharedCompilation=false
+      - name: Publish native streaming regressions
+        run: >-
+          dotnet publish tests/LibProsperoPkg.StreamingNativeTests/LibProsperoPkg.StreamingNativeTests.csproj
+          -c Release -r ${{ matrix.rid }} --artifacts-path .TestArtifacts/Native
+          -p:UseSharedCompilation=false -o .TestArtifacts/Executable
+      - name: Native streaming regressions
+        run: .TestArtifacts/Executable/LibProsperoPkg.StreamingNativeTests

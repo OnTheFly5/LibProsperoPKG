@@ -18,6 +18,7 @@ using LibProsperoPkg.PKG;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 
 namespace LibProsperoPkg.PFS;
 
@@ -97,12 +98,23 @@ public static class ProsperoPs5InnerImageReader
         var mount = new byte[mountSize];
         byte[] innerArr = innerImage.ToArray();
 
+        // In this data-first nwonly profile the last non-terminator RUN starts metadata.
+        // The preceding STD describes the logical zero-filled hole, not ordinary source bytes.
+        int metadataRun = -1;
+        for (int i = 0; i + 1 < cb.Count; i++)
+            if (cb[i].IsRunBase && !cb[i + 1].IsRunBase && cb[i + 1].Odd != 0)
+                metadataRun = i;
+        if (metadataRun < 0)
+            throw new InvalidDataException("NAPS has no metadata run.");
+
+        bool terminated = false;
         long onDisk = 0, uncompOff = 0;
         for (int i = 0; i < cb.Count; i++)
         {
             NapsCblockInfoEntry e = cb[i];
             if (e.IsRunBase)
             {
+                if (i == metadataRun) uncompOff = metaBase;
                 // On-disk cursor re-anchors at each run: 32K-granular base + the fractional byte offset
                 // carried in the following STD's low-15 coffMod bits.
                 long frac = (i + 1 < cb.Count && !cb[i + 1].IsRunBase)
@@ -111,16 +123,31 @@ public static class ProsperoPs5InnerImageReader
                 continue;
             }
 
+            if (e.Even == 0 && e.Odd == 0)
+            {
+                if (i != cb.Count - 1 || i <= metadataRun || uncompOff != mountSize)
+                    throw new InvalidDataException("NAPS terminates before the metadata extent is complete.");
+                terminated = true;
+                break;
+            }
+            if (e.KdePredictor is not (0 or 2 or 4))
+                throw new NotSupportedException("Unsupported inner-block KDE predictor.");
+            if (i == metadataRun - 1)
+            {
+                if (e.KdePredictor != 4 || e.Even != 0 || e.ClenEvenMinus1 != 14)
+                    throw new InvalidDataException("Unsupported nwonly metadata padding record.");
+                continue; // the freshly allocated mount already contains the logical zero-filled hole
+            }
             long fileEnd = NextBoundary(boundaries, uncompOff, mountSize);
             long uncompLen = Math.Min(Ublock256K, fileEnd - uncompOff);
             if (uncompLen <= 0 || i + 1 >= cb.Count)
-                break;
+                throw new InvalidDataException("NAPS is missing a required block boundary.");
 
             int evenComp = (int)(e.ClenEvenMinus1 / 2 + 1);
             NapsCblockInfoEntry next = cb[i + 1];
             long thisRel = e.CoffsetStartMod256K;
             long nextRel = next.IsRunBase ? next.CoffsetEndMod256K : next.CoffsetStartMod256K;
-            int totalComp = (int)(nextRel - thisRel);
+            int totalComp = (int)((nextRel - thisRel) & (Ublock256K - 1));
             bool kraken = e.KdePredictor == 2;
 
             DecodeBlockInto(innerArr, onDisk, totalComp, evenComp, (int)uncompLen, kraken,
@@ -129,6 +156,9 @@ public static class ProsperoPs5InnerImageReader
             uncompOff += uncompLen;
             onDisk += kraken ? totalComp : uncompLen;
         }
+
+        if (!terminated || uncompOff != mountSize)
+            throw new InvalidDataException("NAPS has no complete terminal metadata extent.");
 
         // Locate the metadata superblock (version 2 + magic 20130315) at a 64K boundary. The metadata PFS
         // sits at the top of the mount, so scan downward and take the highest match; fall back to the
@@ -155,23 +185,51 @@ public static class ProsperoPs5InnerImageReader
     /// differs from the layout <see cref="ProsperoPfsReader"/> reads, so this does not use it.
     /// </summary>
     public static IReadOnlyList<ProsperoPs5InnerFileEntry> ReadFileTree(byte[] mount, long metaBase)
+        => ReadFileTreeCore(mount, metaBase, 0);
+
+    /// <summary>
+    /// Walks retained plaintext metadata without allocating the logical mount or reading file payloads.
+    /// Directory addresses are translated from the declared logical base into this metadata buffer.
+    /// Returned file offsets remain absolute logical offsets, including values beyond 4 GiB.
+    /// </summary>
+    public static IReadOnlyList<ProsperoPs5InnerFileEntry> ReadFileTreeFromMetadata(
+        byte[] metadata, long metadataLogicalBase)
     {
-        ReadOnlySpan<byte> sb = mount.AsSpan((int)metaBase);
+        ArgumentOutOfRangeException.ThrowIfNegative(metadataLogicalBase);
+        return ReadFileTreeCore(metadata, 0, metadataLogicalBase);
+    }
+
+    private static IReadOnlyList<ProsperoPs5InnerFileEntry> ReadFileTreeCore(
+        byte[] mount, long metaBase, long logicalBase)
+    {
+        ArgumentNullException.ThrowIfNull(mount);
+        ArgumentOutOfRangeException.ThrowIfNegative(metaBase);
+        if (metaBase > mount.LongLength - 0x48)
+            throw new InvalidDataException("Inner metadata superblock is truncated.");
+        ReadOnlySpan<byte> sb = mount.AsSpan(checked((int)metaBase));
         if (System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(sb) != 2 ||
             System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(sb[8..]) != 20130315)
-            throw new InvalidOperationException("Inner mount metadata does not start with a PS5 PFS superblock.");
+            throw new InvalidDataException("Inner mount metadata does not start with a PS5 PFS superblock.");
 
         int blockSize = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(sb[0x20..]);
-        int inodeCount = (int)System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(sb[0x30..]);
-        if (blockSize <= 0 || inodeCount <= 0 || inodeCount > 1_000_000)
-            throw new InvalidOperationException("Implausible inner metadata superblock (block size / inode count).");
+        long rawInodeCount = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(sb[0x30..]);
+        if (blockSize != ProsperoPs5InnerMetadata.BlockSize || rawInodeCount <= 0 || rawInodeCount > 1_000_000)
+            throw new InvalidDataException("Implausible inner metadata superblock (block size / inode count).");
 
         // Parse the inode table (block 1). PS5 inner inode: Mode@0, Size@8, LogicalOffset@0x60, parent@0x6c.
+        int inodeCount = checked((int)rawInodeCount);
         long inodeTable = metaBase + blockSize;
+        int sectors = ProsperoPs5InnerMetadata.InodeBlockCount(inodeCount);
+        long declaredSectors = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(sb[0x40..]);
+        if (declaredSectors < sectors || inodeTable + (long)sectors * blockSize > mount.LongLength)
+            throw new InvalidDataException("Inner inode table is truncated or under-declared.");
         var nodes = new InnerInode[inodeCount];
         for (int i = 0; i < inodeCount; i++)
         {
-            ReadOnlySpan<byte> e = mount.AsSpan((int)(inodeTable + i * 0xA8), 0xA8);
+            ReadOnlySpan<byte> e = mount.AsSpan(checked((int)(inodeTable
+                + (long)(i / ProsperoPs5InnerMetadata.InodesPerBlock) * blockSize
+                + (i % ProsperoPs5InnerMetadata.InodesPerBlock) * ProsperoPs5InnerMetadata.InodeSize)),
+                ProsperoPs5InnerMetadata.InodeSize);
             nodes[i] = new InnerInode
             {
                 Mode = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(e),
@@ -182,7 +240,7 @@ public static class ProsperoPs5InnerImageReader
 
         // Walk the directory tree from the super-root (inode 0), collecting files under "uroot".
         var files = new List<ProsperoPs5InnerFileEntry>();
-        WalkDir(mount, blockSize, nodes, 0, "", underUroot: false, files, new HashSet<uint>());
+        WalkDir(mount, logicalBase, blockSize, nodes, 0, "", underUroot: false, files, new HashSet<uint>());
         return files;
     }
 
@@ -194,7 +252,7 @@ public static class ProsperoPs5InnerImageReader
         public bool IsDirectory => (Mode & 0x4000) != 0;
     }
 
-    private static void WalkDir(byte[] mount, int blockSize, InnerInode[] nodes, uint dirInode,
+    private static void WalkDir(byte[] mount, long logicalBase, int blockSize, InnerInode[] nodes, uint dirInode,
         string path, bool underUroot, List<ProsperoPs5InnerFileEntry> files, HashSet<uint> seen)
     {
         if (dirInode >= nodes.Length || !seen.Add(dirInode))
@@ -203,22 +261,46 @@ public static class ProsperoPs5InnerImageReader
         if (!dir.IsDirectory || dir.Size <= 0)
             return;
 
-        long start = (long)dir.LogicalOffset;
-        long end = Math.Min(start + dir.Size, mount.Length);
+        if (dir.LogicalOffset > long.MaxValue)
+            throw new InvalidDataException("Directory address exceeds the supported logical range.");
+        long start = checked((long)dir.LogicalOffset - logicalBase);
+        if (start < 0 || start > mount.LongLength || dir.Size > mount.LongLength - start)
+            throw new InvalidDataException("Directory extends outside retained metadata.");
+        long end = checked(start + dir.Size);
         using var ms = new System.IO.MemoryStream(mount, (int)start, (int)(end - start), writable: false);
-        while (ms.Position + 0x10 <= ms.Length)
+        while (ms.Position < ms.Length)
         {
             long entryPos = ms.Position;
-            ProsperoPfsDirent d;
-            try { d = ProsperoPfsDirent.ReadFromStream(ms); }
-            catch { break; }
-            if (d.EntSize <= 0) break;
-            ms.Position = entryPos + d.EntSize;
-
-            string name = d.Name;
-            if (string.IsNullOrEmpty(name) || name == "." || name == "..")
+            int sectorRemaining = (int)Math.Min(blockSize - entryPos % blockSize, ms.Length - entryPos);
+            var sectorTail = mount.AsSpan(checked((int)(start + entryPos)), sectorRemaining);
+            if (sectorTail.Length < 16)
+            {
+                if (sectorTail.IndexOfAnyExcept((byte)0) >= 0)
+                    throw new InvalidDataException("Truncated directory entry header.");
+                ms.Position += sectorTail.Length;
                 continue;
-            if (d.InodeNumber >= nodes.Length)
+            }
+            if (sectorTail[..16].IndexOfAnyExcept((byte)0) < 0)
+            {
+                if (sectorTail.IndexOfAnyExcept((byte)0) >= 0)
+                    throw new InvalidDataException("Nonzero bytes after directory padding.");
+                ms.Position += sectorTail.Length;
+                continue;
+            }
+            int nameLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(sectorTail[8..]);
+            int entrySize = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(sectorTail[12..]);
+            if (nameLength < 1 || nameLength > 255 || entrySize < nameLength + 17
+                || entrySize % 8 != 0 || entrySize > sectorRemaining || sectorTail[16 + nameLength] != 0)
+                throw new InvalidDataException("Invalid or cross-sector directory entry.");
+            var nameBytes = sectorTail.Slice(16, nameLength);
+            if (nameBytes.IndexOf((byte)0) >= 0 || nameBytes.IndexOfAnyInRange((byte)0x80, (byte)0xff) >= 0)
+                throw new InvalidDataException("Unsupported directory name encoding.");
+            ProsperoPfsDirent d = ProsperoPfsDirent.ReadFromStream(ms);
+            if (d.InodeNumber >= nodes.Length || !Enum.IsDefined(d.Type))
+                throw new InvalidDataException("Directory references an invalid inode or entry type.");
+            ms.Position = entryPos + d.EntSize;
+            string name = d.Name;
+            if (name == "." || name == "..")
                 continue;
 
             // The super-root wraps the content under "uroot" (its other children are internal flat-path
@@ -229,7 +311,7 @@ public static class ProsperoPs5InnerImageReader
                 : path + "/" + name;
 
             if (d.Type == ProsperoDirentType.Directory)
-                WalkDir(mount, blockSize, nodes, d.InodeNumber, childPath, childUnderUroot, files, seen);
+                WalkDir(mount, logicalBase, blockSize, nodes, d.InodeNumber, childPath, childUnderUroot, files, seen);
             else if (d.Type == ProsperoDirentType.File && underUroot && childPath.Length > 0)
                 files.Add(new ProsperoPs5InnerFileEntry
                 {
@@ -266,17 +348,14 @@ public static class ProsperoPs5InnerImageReader
 
         if (!kraken)
         {
-            // Raw store: copy the uncompressed bytes straight through (bounded by the image length).
-            if (onDisk >= 0 && onDisk < inner.Length)
-            {
-                int avail = (int)Math.Min(copyLen, inner.Length - onDisk);
-                Array.Copy(inner, onDisk, mount, mountOff, avail);
-            }
+            if (onDisk < 0 || onDisk > inner.LongLength - copyLen)
+                throw new InvalidDataException("Stored inner block extends beyond the image.");
+            Array.Copy(inner, onDisk, mount, mountOff, copyLen);
             return;
         }
 
-        if (onDisk < 0 || onDisk + totalComp > inner.Length || totalComp <= 0)
-            return;
+        if (onDisk < 0 || totalComp <= 0 || onDisk > inner.LongLength - totalComp)
+            throw new InvalidDataException("Compressed inner block extends beyond the image.");
 
         var src = inner.AsSpan((int)onDisk, totalComp);
         int firstChunkComp = uncompLen > Chunk128K ? evenComp : 0;
@@ -295,6 +374,7 @@ public static class ProsperoPs5InnerImageReader
             Array.Copy(decoded, 0, mount, mountOff, copyLen);
             return;
         }
+        throw new InvalidDataException("Inner Kraken block could not be decoded.");
     }
 
     private static int[] FlagCandidates(bool multiChunk) => multiChunk

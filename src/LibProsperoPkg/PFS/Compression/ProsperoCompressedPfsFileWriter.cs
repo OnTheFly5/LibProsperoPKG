@@ -249,7 +249,7 @@ public static class ProsperoCompressedPfsFileWriter
         if (!destination.CanWrite || !source.CanRead)
             throw new ArgumentException("Readable input and writable output are required.");
         var blocks = new System.Collections.Generic.List<ProsperoInnerPayloadBlock>();
-        var buffer = new byte[DefaultBlockSize];
+        var buffer = new byte[(int)Math.Min(DefaultBlockSize, sourceLength)];
         long logical = 0, physical = 0;
         Span<byte> digest = stackalloc byte[32];
         Span<byte> signature = stackalloc byte[16];

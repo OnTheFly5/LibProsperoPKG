@@ -74,16 +74,43 @@ layout, integrity and signing dependencies.
 - Output failures and cancellation propagate to the caller. Output may be
   incomplete; the caller owns cleanup. These methods do not manage `.part`
   publication or retry policy.
-- The current inner metadata representation reserves one 64 KiB inode block
-  (390 records maximum) and one block per auxiliary table/directory. Oversized
-  representations fail explicitly instead of overwriting neighboring blocks.
-- The new inner writer also rejects detected overlap between logical file data
-  and metadata in the current highly compressed mount geometry. Larger-layout
-  support requires separate format work.
-- NAPS/SI generation, outer filesystem addressing, source overlays, full-package
-  hashing, no-Kraken package mode, and NativeAOT callback bindings are not
-  integrated with these primitives yet. No console or 100–400 GB claim follows
-  from the streaming fixtures.
+- Inodes are packed into complete 64 KiB sectors (390 entries per sector).
+  Auxiliary tables and directories reserve as many sectors as needed. Entries
+  never cross directory-sector boundaries, and parent offsets include padding.
+- Metadata's logical base moves beyond the logical data end when high
+  compression would make the original physical-length-based address overlap.
+  This changes formerly invalid layouts while preserving the small golden fixture.
+- The current name codec is ASCII. Streaming source descriptors reject
+  unsupported Unicode names and unrepresentable 40-bit sizes/offsets before
+  opening payload readers rather than silently renaming/truncating them.
+- Outer filesystem addressing, SI generation, source overlays, full-package
+  hashing, no-Kraken package mode, and NativeAOT callback bindings remain to be
+  integrated. No console or 100–400 GB package claim follows from these fixtures.
+
+## NAPS and metadata inspection
+
+`ProsperoNwonlyNapsGenerator.Generate(ProsperoPs5InnerImageLayout)` builds NAPS
+using the captured records and `OutputLength`, without reading the inner image.
+Both buffered and streamed assemblers now retain real codec block records.
+Mixed compressed/stored files and metadata are modeled per block; empty files
+retain their catalog entries without zero-length data records. Invalid block
+coverage, subchunk sizes, or packed field widths fail explicitly.
+
+The u2c builder uses the documented 24-bit base and seven delta bytes. The
+extra sentinel group for exact multiples of eight is handled explicitly.
+Byte-sized deltas still limit unusually dense block plans. The existing
+successor lookup policy is retained; its native lookup behavior requires
+reference/console validation. The inspection reader does not use u2c, so tests
+check serialized lookup entries separately from payload reconstruction.
+
+`ProsperoPs5InnerImageReader.ReadFileTreeFromMetadata` walks only retained
+metadata and returns full logical offsets, including offsets above 400 GiB,
+without allocating a mount. `ReconstructMount` remains a small-image inspection
+API; it now handles compressed cursor wrap, logical metadata placement, and
+multi-sector inodes, and rejects incomplete or malformed block plans.
+
+Neither API yet eliminates the SI builder's whole-image dependency. Source
+replay and whole-package integrity work remain separate from NAPS generation.
 
 ## Regression checks
 
@@ -98,5 +125,17 @@ Streaming tests compare encoded payloads and patched PFSC containers against
 legacy output; compare a streamed inner image with both the array builder and
 an independently generated hash from pinned revision `db8510e`; exercise
 nonseekable short-reading sources and write-only outputs; check unchanged
-folder inputs, capacity rejection, source shrink/growth, cancellation, write
-errors, bounded read/write sizes, and synthetic-input allocation growth.
+folder inputs, source shrink/growth, cancellation, write errors, bounded
+read/write sizes, and synthetic-input allocation growth. NAPS regressions recover
+every file byte across mixed blocks, cursor wraps, long raw runs, and highly
+compressed input; check serialized lookup bases beyond 255 and sentinel groups;
+and walk 5,000-file/multi-sector metadata. Malformed metadata and field truncation
+have explicit failure regressions. Console compatibility remains unverified.
+
+
+The dedicated `tests/LibProsperoPkg.StreamingNativeTests` project links the same
+streaming regressions for NativeAOT, excluding the managed-only legacy XML
+comparison. See its README for publish/run commands. The managed suite passed
+6,250 assertions and the native streaming runner passed 5,960 on macOS arm64.
+The existing C ABI compatibility proof and independent 5,201 native SHA3 checks
+also passed. Linux and remote workflow results must be checked independently.

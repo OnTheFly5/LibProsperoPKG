@@ -72,6 +72,24 @@ public sealed class ProsperoPs5InnerMetadata
     /// <summary>The inner-image block size (64 KiB).</summary>
     public const int BlockSize = 0x10000;
 
+    /// <summary>Unsigned inode size and per-sector packing used by the PFS reader.</summary>
+    public const int InodeSize = 0xA8;
+    public const int InodesPerBlock = BlockSize / InodeSize;
+
+    /// <summary>Number of complete inode sectors, with no inode straddling a sector boundary.</summary>
+    public static int InodeBlockCount(int inodeCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(inodeCount);
+        return Math.Max(1, checked((inodeCount + InodesPerBlock - 1) / InodesPerBlock));
+    }
+
+    /// <summary>Whole sectors reserved for an auxiliary table or directory, including empty placeholders.</summary>
+    public static int BlocksForBytes(long length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        return Math.Max(1, checked((int)(checked(length + BlockSize - 1) / BlockSize)));
+    }
+
     private readonly long _timeSec;
     private readonly uint _timeNsec;
 
@@ -95,9 +113,9 @@ public sealed class ProsperoPs5InnerMetadata
         for (int t = 0; t < 4; t++) BinaryPrimitives.WriteInt64LittleEndian(dst[(0x18 + t * 8)..], _timeSec);
         for (int t = 0; t < 4; t++) BinaryPrimitives.WriteUInt32LittleEndian(dst[(0x38 + t * 4)..], _timeNsec);
         BinaryPrimitives.WriteUInt64LittleEndian(dst[0x60..], n.LogicalOffset);
-        // db[0] = 0; for the super-root and its direct children (ParentInode == -1) db[1..3] = -1;
+        // 0x60..0x67 is the complete logical byte offset, including its high word.
+        // For the super-root and its direct children (ParentInode == -1) db[1..3] = -1;
         // otherwise db[1] = afid (files) / -1 (dirs), db[2] = parent inode, db[3] = dirent offset in parent.
-        BinaryPrimitives.WriteInt32LittleEndian(dst[0x64..], 0);
         int db1 = n.ParentInode < 0 ? -1 : (n.IsDirectory ? -1 : (int)n.Afid);
         BinaryPrimitives.WriteInt32LittleEndian(dst[0x68..], db1);
         BinaryPrimitives.WriteInt32LittleEndian(dst[0x6c..], n.ParentInode);
@@ -116,7 +134,7 @@ public sealed class ProsperoPs5InnerMetadata
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x28), 1);              // NBlock
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x30), inodeCount);     // DinodeCount
         BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x38), ndblock);        // Ndblock
-        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x40), 1);              // DinodeBlockCount
+        BinaryPrimitives.WriteInt64LittleEndian(sb.AsSpan(0x40), InodeBlockCount(inodeCount)); // DinodeBlockCount
         BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x50), BlockSize);
         BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x54), 0x10);
         BinaryPrimitives.WriteUInt32LittleEndian(sb.AsSpan(0x58), BlockSize);
@@ -146,15 +164,13 @@ public sealed class ProsperoPs5InnerMetadata
     {
         ArgumentNullException.ThrowIfNull(inodes);
         ArgumentNullException.ThrowIfNull(blocks);
-        if (inodes.Count > BlockSize / 0xA8)
-            throw new NotSupportedException("The inner inode table exceeds its reserved 64 KiB block.");
+        int inodeBlocks = InodeBlockCount(inodes.Count);
+        int totalBlocks = checked(1 + inodeBlocks);
         foreach (byte[] block in blocks)
         {
             ArgumentNullException.ThrowIfNull(block);
-            if (block.Length > BlockSize)
-                throw new NotSupportedException("An inner metadata table exceeds its reserved 64 KiB block.");
+            totalBlocks = checked(totalBlocks + BlocksForBytes(block.LongLength));
         }
-        int totalBlocks = checked(2 + blocks.Count);
         // round the number of blocks up so the metadata region is a whole number of blocks
         byte[] outBuf = new byte[checked(totalBlocks * BlockSize)];
 
@@ -162,11 +178,16 @@ public sealed class ProsperoPs5InnerMetadata
 
         // inode table at block 1
         for (int i = 0; i < inodes.Count; i++)
-            WriteInode(outBuf.AsSpan(BlockSize + i * 0xA8, 0xA8), inodes[i]);
+            WriteInode(outBuf.AsSpan(BlockSize + (i / InodesPerBlock) * BlockSize
+                + (i % InodesPerBlock) * InodeSize, InodeSize), inodes[i]);
 
-        // remaining blocks
-        for (int b = 0; b < blocks.Count; b++)
-            blocks[b].CopyTo(outBuf, (2 + b) * BlockSize);
+        // Auxiliary files/directories occupy complete consecutive sectors, not a single fixed slot.
+        int position = checked((1 + inodeBlocks) * BlockSize);
+        foreach (byte[] block in blocks)
+        {
+            block.CopyTo(outBuf, position);
+            position = checked(position + BlocksForBytes(block.LongLength) * BlockSize);
+        }
 
         return outBuf;
     }
