@@ -103,6 +103,52 @@ output exception and turn a failed transfer into success: the sink retains
 and rethrows the failure, without retrying an encrypted block. Cancellation
 propagates, and the caller owns destination cleanup and `.part` publication.
 
+## Finalized FIH and SI without image arrays
+
+`ProsperoFihBuilder.BuildDebugHeader(ProsperoFihHeaderMetadata)` writes the
+64 KiB FIH block from explicit physical/logical geometry and SHA3-256 digests.
+Use the outer result's `GetBlockDigest(SuperblockIndex)`, **not** its ICV, as the
+superblock digest. Use SHA3-256 of the exact NAPS file for 0xB0. The physical
+inner allocation at 0x90 comes from that file's block count, so multi-block NAPS
+cannot inflate it. Logical Ndblock (0xA0) and metadata base (0x50) remain distinct.
+The older array entry point retains its existing behavior.
+
+`ProsperoFinalizedMountDigests.Compute` reads exactly the specified finalized
+FIH+encrypted PFS+CNT range, excluding SI, from the source's current cursor.
+It uses a 64 KiB read buffer and returns whole-mount SHA3, an optional explicit
+superblock hash and PlayGo CRC-32C (one little-endian word per block, including
+a partial tail without padding). It leaves the source open and never seeks.
+Callers must finish/flush patches and position a local `.part` reader before
+calling. Optional capture of final on-disk block hashes serves the legacy
+identity-map SI profile; the nwonly path needs no duplicate block-hash table.
+
+For FTP, the accepted design extends the supported server with a SITE hash
+command after mount patches, then appends SI using APPE. That transport command
+is future work. `ProsperoFinalizedMountDigests` also accepts externally computed
+SHA3/root/CRC metadata; its constructor checks shape, not whether a remote
+implementation hashed the correct range. Source replay is not required by this
+chosen destination-readback design.
+
+`ProsperoNapsMeta.BuildMeta18FromDigests` consumes finalized digests, captured
+whole-file encoded digests and the retained inner layout. The shared payload
+encoder now collects each complete encoded-file SHA3 during the first source
+pass; alignment padding is excluded. Compressed metadata bytes remain retained
+and supply their existing SI range digests. No source payload is reopened.
+
+`ProsperoSiArchive.BuildDebugSiSegmentFromDigests` builds the complete SI ZIP
+from those inputs and `ProsperoPfsImageXmlOptions.NestedInnerLayout`, including
+XML and CRC members. The older NestedInner result API is preserved. Old array
+SI generation also accepts NestedInnerLayout and routes through the new path.
+
+The current SI caller uses aligned **physical** inner OutputLength for phdr and
+meta300, whereas FIH 0xA0 uses logical Ndblock times 64 KiB. The new API preserves
+that actual convention and rejects inconsistent geometry, missing digests,
+out-of-range extents and unsupported 32-bit phdr/file-size fields. It preserves
+the legacy coarse per-file SI projection; large-game SI mapping/widths still
+need format work. A 400 GiB header-only fixture proves scalar serialization,
+not complete-package support at that size. The production package entry point
+still requires streamed CNT construction, source overlays and output lifecycle.
+
 ## Ownership, resources, and limitations
 
 - Payload buffering is bounded by codec block/workspace size. The raw payload
@@ -122,7 +168,7 @@ propagates, and the caller owns destination cleanup and `.part` publication.
 - The current name codec is ASCII. Streaming source descriptors reject
   unsupported Unicode names and unrepresentable 40-bit sizes/offsets before
   opening payload readers rather than silently renaming/truncating them.
-- Higher-level outer filesystem addressing, SI generation, source overlays,
+- Higher-level outer filesystem addressing, SI integration/large-game geometry, source overlays,
   full-package hashing, no-Kraken package mode, and NativeAOT callback bindings remain to be
   integrated. No console or 100–400 GB package claim follows from these fixtures.
 
@@ -148,8 +194,8 @@ without allocating a mount. `ReconstructMount` remains a small-image inspection
 API; it now handles compressed cursor wrap, logical metadata placement, and
 multi-sector inodes, and rejects incomplete or malformed block plans.
 
-Neither API yet eliminates the SI builder's whole-image dependency. Source
-replay and whole-package integrity work remain separate from NAPS generation.
+The SI primitive now consumes captured extent hashes and finalized-mount digests.
+Production integration remains separate from NAPS generation.
 
 ## Regression checks
 
@@ -169,7 +215,11 @@ read/write sizes, and synthetic-input allocation growth. NAPS regressions recove
 every file byte across mixed blocks, cursor wraps, long raw runs, and highly
 compressed input; check serialized lookup bases beyond 255 and sentinel groups;
 and walk 5,000-file/multi-sector metadata. Malformed metadata and field truncation
-have explicit failure regressions. Outer tests independently walk signed
+have explicit failure regressions. Finalization tests compare the entire SI ZIP
+and FIH bytes with buffered output and pinned bc961cf golden hashes; distinguish
+physical SI size from logical FIH size; reject inconsistent geometry/widths;
+and check exact-range SHA3 and CRCs over short-reading inputs and partial tails.
+Outer tests independently walk signed
 single/double pointers, decrypt sampled absolute sectors, check failure
 propagation and callback ownership, and check live-memory growth while writing
 a synthetic 115 MiB image to a sampling sink. Console compatibility remains unverified.
@@ -178,6 +228,6 @@ a synthetic 115 MiB image to a sampling sink. Console compatibility remains unve
 The dedicated `tests/LibProsperoPkg.StreamingNativeTests` project links the same
 streaming regressions for NativeAOT, excluding the managed-only legacy XML
 comparison. See its README for publish/run commands. The managed suite passed
-13,764 assertions and the native streaming runner passed 13,474 on macOS arm64.
+13,866 assertions and the native streaming runner passed 13,575 on macOS arm64.
 The existing C ABI compatibility proof and independent 5,201 native SHA3 checks
 also passed. Linux and remote workflow results must be checked independently.

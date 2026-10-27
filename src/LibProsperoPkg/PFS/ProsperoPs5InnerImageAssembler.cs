@@ -44,6 +44,9 @@ public class ProsperoPs5InnerImageLayout
     public IReadOnlyList<IReadOnlyList<ProsperoInnerPayloadBlock>> FileBlocks { get; init; }
         = Array.Empty<IReadOnlyList<ProsperoInnerPayloadBlock>>();
 
+    /// <summary>SHA3-256 of each complete encoded file payload, in afid order, without alignment padding.</summary>
+    public IReadOnlyList<ReadOnlyMemory<byte>> FileDigests { get; init; } = Array.Empty<ReadOnlyMemory<byte>>();
+
     /// <summary>The uncompressed metadata-region plaintext (the block that is Kraken-compressed into the image tail).</summary>
     public required byte[] MetadataPlaintext { get; init; }
 
@@ -151,6 +154,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         public ProsperoPs5InnerFileSource? Source;
         public long Length => Source?.Length ?? Data.LongLength;
         public long StreamedLength;
+        public ReadOnlyMemory<byte> EncodedDigest;
         public IReadOnlyList<ProsperoInnerPayloadBlock> CodecBlocks = Array.Empty<ProsperoInnerPayloadBlock>();
         public long OnDiskLength => OnDiskData?.LongLength ?? StreamedLength;
         public Dir Parent = null!;
@@ -245,6 +249,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             var payload = ProsperoPs5InnerImageBuilder.WritePayload(
                 f.StoreRaw ? Stream.Null : encoded, input, f.Length, f.StoreRaw);
             f.CodecBlocks = payload.Blocks;
+            f.EncodedDigest = payload.OnDiskDigest;
             f.OnDiskData = f.StoreRaw ? f.Data : encoded.ToArray();
             f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
             f.WholeBlockRaw = IsKeystone(f.FullPath);
@@ -297,6 +302,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             Image = image,
             OutputLength = image.LongLength,
             FileBlocks = afidOrder.Select(f => f.CodecBlocks).ToArray(),
+            FileDigests = afidOrder.Select(f => f.EncodedDigest).ToArray(),
             MetadataPlaintext = metaPlain,
             Nodes = nodes,
             Ndblock = ndblock,
@@ -357,6 +363,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             superRootInode, inodeFltInode, aprFltInode, afidTableInode, out _);
         var afidOffsets = new long[afidOrder.Count];
         var fileBlocks = new List<IReadOnlyList<ProsperoInnerPayloadBlock>>();
+        var fileDigests = new List<ReadOnlyMemory<byte>>();
         long logical = 0, physical = 0;
         foreach (var f in afidOrder)
         {
@@ -386,6 +393,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             f.StreamedLength = result.Length;
             f.CodecBlocks = result.Blocks;
             fileBlocks.Add(result.Blocks);
+            fileDigests.Add(result.OnDiskDigest);
             physical = checked(physical + result.Length);
             if (f.WholeBlockRaw) PadToBlock(destination, ref physical, cancellationToken);
         }
@@ -417,7 +425,7 @@ public sealed class ProsperoPs5InnerImageAssembler
         return new ProsperoPs5InnerImageLayout
         {
             OutputLength = physical, MetadataPlaintext = metadata, Nodes = nodes, Ndblock = ndblock,
-            AfidLogicalOffsets = afidOffsets, FileBlocks = fileBlocks,
+            AfidLogicalOffsets = afidOffsets, FileBlocks = fileBlocks, FileDigests = fileDigests,
             Placements = afidOrder.Select(f => new ProsperoPs5InnerPlacement
             {
                 OnDiskOffset = f.OnDiskOffset, LogicalOffset = f.LogicalOffset,

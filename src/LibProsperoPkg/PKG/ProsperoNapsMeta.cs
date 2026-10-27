@@ -136,11 +136,77 @@ public static class ProsperoNapsMeta
     {
         ArgumentNullException.ThrowIfNull(mountImage);
         ArgumentNullException.ThrowIfNull(contentFiles);
-        if (innerImageSize < PfsBlockSize || mountImage.Length < Meta18BlockSize)
-            return [];
+        if (innerImageSize < PfsBlockSize || mountImage.Length < Meta18BlockSize) return [];
+        var (offset, _) = ProsperoImageDigests.ComputeSblockDigestFromImage(mountImage);
+        using var source = new System.IO.MemoryStream(mountImage, writable: false);
+        var digests = ProsperoFinalizedMountDigests.Compute(source, mountImage.LongLength,
+            offset < 0 ? null : offset, captureBlockDigests: inner is null);
+        return BuildMeta18Core(innerImageSize, digests, contentFiles, inner,
+            inner is null ? null : (off, len) => ProsperoImageDigests.Sha3_256(InnerBlockBytes(inner.Image, off, checked((int)len))));
+    }
 
+    /// <summary>
+    /// Builds the existing SI metric profile from finalized digests and retained inner metadata.
+    /// No mount/inner payload image or payload readback is required. This preserves the legacy
+    /// per-file SI extent projection. innerImageSize is aligned OutputLength (the existing build
+    /// convention), distinct from logical Ndblock in FIH 0xA0. Console acceptance/large widths remain unverified.
+    /// </summary>
+    public static byte[] BuildMeta18FromDigests(ulong innerImageSize, ProsperoFinalizedMountDigests digests,
+        IReadOnlyList<(string Path, long Size)> contentFiles, LibProsperoPkg.PFS.ProsperoPs5InnerImageLayout inner)
+    {
+        ArgumentNullException.ThrowIfNull(digests);
+        ArgumentNullException.ThrowIfNull(contentFiles);
+        ArgumentNullException.ThrowIfNull(inner);
+        if (innerImageSize < PfsBlockSize || innerImageSize > uint.MaxValue || innerImageSize % PfsBlockSize != 0)
+            throw new ArgumentOutOfRangeException(nameof(innerImageSize), "SI phdr geometry must fit the existing 32-bit profile.");
+        if (digests.Length < Meta18BlockSize) throw new ArgumentException("Finalized mount is too short.", nameof(digests));
+        if (inner.OutputLength <= 0 || inner.OutputLength > (long)innerImageSize ||
+            (ulong)((inner.OutputLength - 1) / (long)PfsBlockSize + 1) != innerImageSize / PfsBlockSize ||
+            inner.Ndblock <= 0 || inner.Ndblock > long.MaxValue / (long)PfsBlockSize ||
+            inner.MetadataPlaintext.Length == 0 || inner.MetadataPlaintext.LongLength > inner.Ndblock * (long)PfsBlockSize ||
+            inner.MetaBaseLogical != inner.Ndblock * (long)PfsBlockSize - inner.MetadataPlaintext.LongLength ||
+            inner.DataEndLogical < 0 || inner.DataEndLogical > inner.MetaBaseLogical ||
+            inner.MetadataOnDiskOffset < 0 ||
+            inner.MetadataOnDiskOffset > inner.OutputLength - inner.CompressedMetadata.LongLength)
+            throw new ArgumentException("SI geometry does not match the captured inner layout.", nameof(inner));
+        foreach (var (path, size) in contentFiles)
+        {
+            if (path is null || path.IndexOf('\0') >= 0 || size < 0)
+                throw new ArgumentException("Invalid SI content-file path or size.", nameof(contentFiles));
+            foreach (char c in path)
+                if (c > 0x7f) throw new ArgumentException("SI paths require the current ASCII profile.", nameof(contentFiles));
+        }
+        if (inner.FileDigests.Count != inner.Placements.Count)
+            throw new ArgumentException("Every file requires its captured encoded-payload digest.", nameof(inner));
+        var rangeDigests = new Dictionary<(long, uint), byte[]>();
+        for (int i = 0; i < inner.Placements.Count; i++)
+        {
+            var p = inner.Placements[i];
+            if (p.OnDiskOffset < 0 || p.OnDiskSize < 0 || p.OnDiskSize > uint.MaxValue || p.OnDiskOffset > inner.OutputLength - p.OnDiskSize ||
+                p.UncompressedSize < 0 || p.UncompressedSize > uint.MaxValue || inner.FileDigests[i].Length != 32)
+                throw new ArgumentException("SI file extent exceeds the existing profile or has no SHA3-256 digest.", nameof(inner));
+            rangeDigests[(p.OnDiskOffset, (uint)p.OnDiskSize)] = inner.FileDigests[i].ToArray();
+        }
+        foreach (var block in BuildInnerBlocks(inner))
+        {
+            if (block.IsHole || block.Tail != Meta300KindId) continue;
+            long relative = block.OnDiskOffset - inner.MetadataOnDiskOffset;
+            if (relative < 0 || relative > inner.CompressedMetadata.LongLength - block.OnDiskLen)
+                throw new ArgumentException("Missing retained compressed metadata bytes.", nameof(inner));
+            rangeDigests[(block.OnDiskOffset, block.OnDiskLen)] =
+                ProsperoImageDigests.Sha3_256(inner.CompressedMetadata.AsSpan(checked((int)relative), checked((int)block.OnDiskLen)));
+        }
+        return BuildMeta18Core(innerImageSize, digests, contentFiles, inner,
+            (offset, length) => rangeDigests.TryGetValue((offset, length), out var digest) ? digest
+                : throw new InvalidOperationException("Missing SI extent digest."));
+    }
+
+    private static byte[] BuildMeta18Core(ulong innerImageSize, ProsperoFinalizedMountDigests digests,
+        IReadOnlyList<(string Path, long Size)> contentFiles, LibProsperoPkg.PFS.ProsperoPs5InnerImageLayout? inner,
+        Func<long, uint, byte[]>? innerDigest)
+    {
         uint innerBlocks = (uint)(innerImageSize / PfsBlockSize);
-        int outerBlocks = mountImage.Length / Meta18BlockSize;
+        int outerBlocks = checked((int)(digests.Length / Meta18BlockSize));
 
         // nwonly: build ibcl/i2ob/i2op/ihsh/file over the compressed INNER-image NAPS block map so the
         // installer derives a nonzero, 0x10000-aligned content package_size and clears the 0x80b21185
@@ -293,7 +359,7 @@ public static class ProsperoNapsMeta
                     }
                     else
                     {
-                        byte[] h = ProsperoImageDigests.Sha3_256(InnerBlockBytes(inner!.Image, b.OnDiskOffset, (int)b.OnDiskLen));
+                        byte[] h = innerDigest!(b.OnDiskOffset, b.OnDiskLen);
                         h.AsSpan(0, 32).CopyTo(e.Slice(0x08, 32));
                         BinaryPrimitives.WriteUInt64LittleEndian(e.Slice(0x28, 8), b.Tail);
                     }
@@ -308,7 +374,7 @@ public static class ProsperoNapsMeta
                     Span<byte> e = body.AsSpan(i * 0x30, 0x30);
                     WriteU32(e, 0x00, (uint)i);
                     WriteU32(e, 0x04, (uint)Meta18BlockSize);
-                    byte[] h = ProsperoImageDigests.Sha3_256(mountImage.AsSpan(i * Meta18BlockSize, Meta18BlockSize));
+                    byte[] h = digests.GetBlockDigest(i).ToArray();
                     h.AsSpan(0, 32).CopyTo(e.Slice(0x08, 32));
                 }
                 WriteRecord(plain, "ihsh", 1, body);
@@ -318,9 +384,7 @@ public static class ProsperoNapsMeta
         // rhsh: root digest over the superblock block, remainder zero (176 bytes).
         {
             var body = new byte[0xB0];
-            (_, byte[]? sb) = ProsperoImageDigests.ComputeSblockDigestFromImage(mountImage);
-            if (sb is { Length: >= 32 })
-                sb.AsSpan(0, 32).CopyTo(body.AsSpan(0, 32));
+            digests.SuperblockDigest.Span.CopyTo(body.AsSpan(0, 32));
             WriteRecord(plain, "rhsh", 1, body);
         }
 
@@ -345,7 +409,7 @@ public static class ProsperoNapsMeta
         // obdg: outer digest over the whole finalized image, remainder zero (128 bytes).
         {
             var body = new byte[0x80];
-            byte[] od = ProsperoImageDigests.Sha3_256(mountImage);
+            byte[] od = digests.MountDigest.ToArray();
             od.AsSpan(0, 32).CopyTo(body.AsSpan(0, 32));
             WriteRecord(plain, "obdg", 1, body);
         }
@@ -457,7 +521,7 @@ public static class ProsperoNapsMeta
     /// <c>[DataEndLogical, MetaBaseLogical)</c>, and the metadata ublocks (<c>MetadataBlocks</c>). This is
     /// the same geometry <see cref="ProsperoNwonlyNapsGenerator"/> emits for <c>naps_pkg_layout.dat</c>.
     /// </summary>
-    private static List<Meta18Block> BuildInnerBlocks(LibProsperoPkg.PFS.ProsperoPs5InnerImageResult inner)
+    private static List<Meta18Block> BuildInnerBlocks(LibProsperoPkg.PFS.ProsperoPs5InnerImageLayout inner)
     {
         var blocks = new List<Meta18Block>();
 

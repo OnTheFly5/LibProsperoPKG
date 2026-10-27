@@ -42,5 +42,7 @@ public readonly struct ProsperoInnerPayloadBlock
 public sealed class ProsperoInnerPayloadResult
 {
     public required long Length { get; init; }
+    /// <summary>SHA3-256 of the concatenated encoded payload, excluding outer alignment padding.</summary>
+    public ReadOnlyMemory<byte> OnDiskDigest { get; init; }
     public required IReadOnlyList<ProsperoInnerPayloadBlock> Blocks { get; init; }
 }

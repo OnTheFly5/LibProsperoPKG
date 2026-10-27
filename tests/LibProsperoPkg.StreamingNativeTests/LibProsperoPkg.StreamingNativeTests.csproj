@@ -13,5 +13,6 @@
     <Compile Include="../LibProsperoPkg.Tests/StreamingTests.cs" Link="StreamingTests.cs" />
     <Compile Include="../LibProsperoPkg.Tests/NapsStreamingTests.cs" Link="NapsStreamingTests.cs" />
     <Compile Include="../LibProsperoPkg.Tests/OuterStreamingTests.cs" Link="OuterStreamingTests.cs" />
+    <Compile Include="../LibProsperoPkg.Tests/FinalizationTests.cs" Link="FinalizationTests.cs" />
   </ItemGroup>
 </Project>

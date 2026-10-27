@@ -3,7 +3,8 @@
 This executable links the same streaming/NAPS/outer-image regression sources used by the
 managed suite. It exercises the new APIs directly under NativeAOT, including
 codec payloads, deferred patches, metadata layouts and readers, and encrypted
-outer images with unknown-length producers and signed indirect pointers. It excludes the
+outer images with unknown-length producers and signed indirect pointers,
+metadata-only FIH/SI, and bounded finalized-mount SHA3/CRC generation. It excludes the
 managed suite's legacy XML serialization reference, which intentionally uses
 dynamic serialization as a comparison baseline.
 

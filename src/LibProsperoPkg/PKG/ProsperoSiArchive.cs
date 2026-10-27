@@ -245,6 +245,9 @@ public sealed class ProsperoPfsImageXmlOptions
     /// </summary>
     public LibProsperoPkg.PFS.ProsperoPs5InnerImageResult? NestedInner { get; set; }
 
+    /// <summary>Payload-free inner layout for streamed SI/XML generation; takes precedence over NestedInner.</summary>
+    public ProsperoPs5InnerImageLayout? NestedInnerLayout { get; set; }
+
     /// <summary>
     /// PlayGo chunk layout for the <c>&lt;chunkinfo&gt;</c> section. When set, the section is emitted
     /// from our own package geometry; when <see langword="null"/> the section is omitted.
@@ -359,6 +362,18 @@ public static class ProsperoSiArchive
     {
         ArgumentNullException.ThrowIfNull(pfsImageXml);
         ArgumentNullException.ThrowIfNull(mountImage);
+        if (pfsImageXml.NestedInnerLayout is { } streamedLayout)
+        {
+            if (streamedLayout.OutputLength <= 0 || streamedLayout.OutputLength > uint.MaxValue)
+                throw new ArgumentException("Inner SI geometry exceeds the existing profile.", nameof(pfsImageXml));
+            long aligned = (streamedLayout.OutputLength + 0xffff) / 0x10000 * 0x10000;
+            if (innerImageSize > 0 && innerImageSize != aligned)
+                throw new ArgumentException("SI size must match aligned physical inner output.", nameof(innerImageSize));
+            var (offset, _) = ProsperoImageDigests.ComputeSblockDigestFromImage(mountImage);
+            using var source = new MemoryStream(mountImage, writable: false);
+            var hashes = ProsperoFinalizedMountDigests.Compute(source, mountImage.LongLength, offset < 0 ? null : offset);
+            return BuildDebugSiSegmentFromDigests(pfsImageXml, playGoChunkDat, hashes, warnings);
+        }
 
         // naps_meta_300 R = InnerImageSize - 0x10000 (block-aligned inner-image size minus one FIH block).
         // Prefer the builder-captured InnerImageSize; when it is not supplied (standalone callers), read
@@ -417,6 +432,32 @@ public static class ProsperoSiArchive
     }
 
     /// <summary>
+    /// Builds the debug SI ZIP from retained layout and finalized-mount integrity metadata.
+    /// No mount or inner-image payload array is required. The caller must finalize all FIH/PFS/CNT
+    /// patches before calculating mountDigests, and append this ZIP only after that mount region.
+    /// </summary>
+    public static byte[] BuildDebugSiSegmentFromDigests(ProsperoPfsImageXmlOptions options,
+        byte[]? playGoChunkDat, ProsperoFinalizedMountDigests mountDigests, ICollection<string>? warnings = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(mountDigests);
+        var inner = options.NestedInnerLayout ?? options.NestedInner
+            ?? throw new ArgumentException("A captured inner layout is required.", nameof(options));
+        if (options.PfsImageSize <= 0 || options.PfsImageSize > mountDigests.Length - ProsperoImageDigests.BlockSize)
+            throw new ArgumentException("Outer image does not fit the finalized mount.", nameof(options));
+        if (inner.OutputLength <= 0 || inner.OutputLength > uint.MaxValue)
+            throw new ArgumentException("Inner SI geometry exceeds the existing 32-bit profile.", nameof(options));
+        ulong innerSize = (ulong)((inner.OutputLength - 1) / (long)ProsperoNapsMeta.PfsBlockSize + 1) * ProsperoNapsMeta.PfsBlockSize;
+        var content = CollectContentFilesFromInner(inner).ToList();
+        content.Add(("*PFSmetadata", options.PfsImageSize));
+        byte[] meta18 = ProsperoNapsMeta.BuildMeta18FromDigests(innerSize, mountDigests, content, inner);
+        byte[] meta300 = ProsperoNapsMeta.BuildMeta300FromInnerImageSize(innerSize);
+        byte[] xml = Encoding.UTF8.GetBytes(BuildPfsImageXml(options, warnings));
+        return WriteZip(BuildMembers(options.ContentId, xml, playGoChunkDat: playGoChunkDat,
+            napsMeta18: meta18, napsMeta300: meta300, playGoChunkCrc: mountDigests.PlayGoChunkCrc.ToArray()));
+    }
+
+    /// <summary>
     /// Flattens a nested-image file tree into the content-file list (relative path, plain size) the
     /// <c>naps_meta_18</c> file/fstr records enumerate. Directories are skipped; files are returned in
     /// depth-first pre-order.
@@ -449,7 +490,7 @@ public static class ProsperoSiArchive
     /// the mount assigns; each node's <c>FullPath</c> (e.g. <c>/sce_sys/keystone</c>) is made root-relative.
     /// </summary>
     private static IReadOnlyList<(string Path, long Size)> CollectContentFilesFromInner(
-        LibProsperoPkg.PFS.ProsperoPs5InnerImageResult inner)
+        LibProsperoPkg.PFS.ProsperoPs5InnerImageLayout inner)
     {
         var byInode = new Dictionary<uint, LibProsperoPkg.PFS.ProsperoPs5MetaNode>();
         foreach (var node in inner.Nodes)
@@ -740,7 +781,7 @@ public static class ProsperoSiArchive
             AppendChunkInfo(sb, options.ContentId, chunk);
         if (options.OuterPfsTree is { } outer)
             AppendPfsImage(sb, outer, options.PfsImageOffset);
-        if (options.NestedInner is { } innerResult)
+        if ((options.NestedInnerLayout ?? options.NestedInner) is { } innerResult)
             AppendNestedImageFromInner(sb, innerResult);
         else if (options.NestedPfsTree is { } nested)
             AppendNestedImage(sb, nested);
@@ -799,7 +840,7 @@ public static class ProsperoSiArchive
     // actual reconstructed inner mount: the 0x4a0000 image size, the three flat-path tables, per-directory
     // physical offsets (poffset = the node's logical mount offset), and per-file on-disk data offsets
     // (offset = the packed data-region offset), afids and imodes.
-    private static void AppendNestedImageFromInner(StringBuilder sb, ProsperoPs5InnerImageResult inner)
+    private static void AppendNestedImageFromInner(StringBuilder sb, ProsperoPs5InnerImageLayout inner)
     {
         const int BLK = ProsperoPs5InnerMetadata.BlockSize; // 0x10000
         var nodes = inner.Nodes;

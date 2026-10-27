@@ -250,6 +250,7 @@ public static class ProsperoCompressedPfsFileWriter
             throw new ArgumentException("Readable input and writable output are required.");
         var blocks = new System.Collections.Generic.List<ProsperoInnerPayloadBlock>();
         var buffer = new byte[(int)Math.Min(DefaultBlockSize, sourceLength)];
+        using var fileDigest = new LibProsperoPkg.Util.Sha3Digest();
         long logical = 0, physical = 0;
         Span<byte> digest = stackalloc byte[32];
         Span<byte> signature = stackalloc byte[16];
@@ -270,6 +271,7 @@ public static class ProsperoCompressedPfsFileWriter
                 useHuffmanArrays: true, digest, signature);
             cancellationToken.ThrowIfCancellationRequested();
             destination.Write(block.Payload);
+            fileDigest.AppendData(block.Payload);
             blocks.Add(new ProsperoInnerPayloadBlock
             {
                 OnDiskOffset = physical, LogicalOffset = logical,
@@ -280,7 +282,7 @@ public static class ProsperoCompressedPfsFileWriter
             physical = checked(physical + block.Payload.Length);
             logical = checked(logical + count);
         } while (logical < sourceLength);
-        return new ProsperoInnerPayloadResult { Length = physical, Blocks = blocks };
+        return new ProsperoInnerPayloadResult { Length = physical, Blocks = blocks, OnDiskDigest = fileDigest.GetHashAndReset() };
     }
 
     /// <summary>

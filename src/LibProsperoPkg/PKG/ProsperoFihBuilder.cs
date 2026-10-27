@@ -30,8 +30,8 @@
 // SHA3-256 of the plaintext outer superblock. The CNT package-digest self-seal at CNT+0xFE0
 // is SHA3-256 of CNT[0:0xFE0]. The CNT GeneralDigests block and per-entry digest table are
 // SHA3-256 of plaintext CNT regions and entries. The distinct FIH slot at 0xB0 is the
-// nested-image-content digest: SHA3-256 of the uncompressed inner PFS image at its logical
-// size. The CNT build path threads that exact preimage in. The standalone-finalize path has
+// nested-image-content digest: SHA3-256 of naps_pkg_layout.dat. The nwonly CNT
+// build path threads that exact preimage in. The standalone-finalize path has
 // only a finished encrypted CNT, so it falls back to SHA3-256 of the outer image. The trailing
 // SI ZIP is generated only when the caller passes one through the siArchive parameter; its
 // container is deterministic and its keyed members are caller-supplied. A console in debug mode
@@ -87,13 +87,11 @@ public static class ProsperoFihBuilder
     /// image. Ignored when <paramref name="siArchive"/> is non-null.
     /// </param>
     /// <param name="nestedImageDigest">
-    /// Optional 32-byte FIH 0xB0 nested-image-content digest — SHA3-256 of the UNCOMPRESSED inner PFS
-    /// image at its plain size. The CNT build
-    /// path (<see cref="ProsperoPkgBuilder"/>) computes this while it still has the plaintext inner
-    /// image and threads it in. When null, standalone finalize falls back to a best-effort SHA3-256
-    /// of the outer image (it cannot recover the encrypted inner image on its own).
+    /// Optional 32-byte FIH 0xB0 digest. The nwonly CNT build path
+    /// (<see cref="ProsperoPkgBuilder"/>) supplies SHA3-256 of the exact NAPS file bytes.
+    /// When null, standalone finalize falls back to a best-effort SHA3-256 of the outer image.
     /// </param>
-    /// <param name="nestedImageSize">Plain (uncompressed) size of the inner PFS image, or 0 when not nwonly.</param>
+    /// <param name="nestedImageSize">NAPS file length for FIH 0xA8, or 0 when not nwonly.</param>
     /// <param name="nestedMetaBaseBlocks">Inner mount metadata-base block index (MetaBaseLogical / block size), or 0.</param>
     /// <param name="nwonlyContentVersionHi">High 32 bits of the content-version word stamped into the FIH header.</param>
     /// <param name="nwonlyInnerContentInodes">Inner content-inode count (directories and files below uroot).</param>
@@ -187,8 +185,7 @@ public static class ProsperoFihBuilder
     /// by both the standalone FIH writer (<see cref="BuildFromCnt"/>) and the PS5 CNT builder so the
     /// fixed-info-digest (SHA3-256 of this block) is self-consistent. The image-content slot 0xB0 is the
     /// nested-image-content digest: when <paramref name="nestedImageDigest"/> is supplied (the CNT build path,
-    /// which has the uncompressed inner image in hand) it is written verbatim as SHA3-256 of the
-    /// UNCOMPRESSED inner PFS image at its plain size; when it
+    /// which has the finalized NAPS layout in hand) it is written verbatim as SHA3-256 of that layout; when it
     /// is null (the standalone finalize path, which only has the finished encrypted CNT) it falls back to the
     /// best-effort SHA3-256(outer image). Cycle-free either way: both inputs are final before the CNT digest
     /// table is computed (using the embedded CNT metadata here would create a digest cycle).
@@ -199,6 +196,47 @@ public static class ProsperoFihBuilder
         byte[]? nestedImageDigest = null, long nestedImageSize = 0, long nestedMetaBaseBlocks = 0,
         uint nwonlyContentVersionHi = 0, int nwonlyInnerContentInodes = 0, int nwonlyAppFileCount = 0,
         long nwonlyNdblock = 0)
+    {
+        var (offset, digest) = ProsperoImageDigests.ComputeSblockDigestFromImage(image);
+        return BuildFihHeaderCore(variant, pfsImageSize, embeddedCntOffset, offset, digest,
+            () => ProsperoImageDigests.Sha3_256(image), warnings, nestedImageDigest, nestedImageSize,
+            nestedMetaBaseBlocks, nwonlyContentVersionHi, nwonlyInnerContentInodes, nwonlyAppFileCount, nwonlyNdblock);
+    }
+
+    /// <summary>Builds the debug FIH block using final geometry and captured hashes, without reading payloads.</summary>
+    public static byte[] BuildDebugHeader(ProsperoFihHeaderMetadata metadata)
+    {
+        ArgumentNullException.ThrowIfNull(metadata);
+        const long blockSize = ProsperoPkgLayout.FihHeaderRegionSize;
+        if (metadata.PfsSize <= 0 || metadata.PfsSize % blockSize != 0 ||
+            metadata.SuperblockIndex < 2 || metadata.SuperblockIndex > metadata.PfsSize / blockSize - 5 ||
+            metadata.InnerStoredBlockCount < 1 || metadata.InnerStoredBlockCount >= metadata.SuperblockIndex ||
+            metadata.InnerStoredBlockCount > uint.MaxValue || metadata.InnerLogicalBlockCount <= 0 ||
+            metadata.InnerLogicalBlockCount > long.MaxValue / blockSize || metadata.InnerMetadataBaseBlock <= 0 ||
+            metadata.InnerMetadataBaseBlock >= metadata.InnerLogicalBlockCount || metadata.NapsLength <= 0 ||
+            metadata.InnerContentInodes < 0 || metadata.AppFileCount < 0)
+            throw new ArgumentException("Invalid or unrepresentable nwonly FIH geometry.", nameof(metadata));
+        long napsBlocks = (metadata.NapsLength - 1) / blockSize + 1;
+        if (metadata.SuperblockIndex - metadata.InnerStoredBlockCount != napsBlocks)
+            throw new ArgumentException("The two-file nwonly layout must place NAPS between inner data and superblock.", nameof(metadata));
+        if (metadata.SuperblockDigest.Length != 32 || metadata.NapsDigest.Length != 32)
+            throw new ArgumentException("Exactly 32 bytes are required for each SHA3-256 digest.", nameof(metadata));
+        long cntOffset = checked(metadata.PfsSize + blockSize);
+        return BuildFihHeaderCore(ProsperoFihVariant.Debug, (ulong)metadata.PfsSize, (ulong)cntOffset,
+            checked(metadata.SuperblockIndex * blockSize), metadata.SuperblockDigest.ToArray(),
+            () => throw new InvalidOperationException("Streaming FIH must not fall back to hashing an image."),
+            null, metadata.NapsDigest.ToArray(), metadata.NapsLength, metadata.InnerMetadataBaseBlock,
+            metadata.ContentVersionHi, metadata.InnerContentInodes, metadata.AppFileCount,
+            metadata.InnerLogicalBlockCount, metadata.InnerStoredBlockCount, explicitNwonly: true);
+    }
+
+    private static byte[] BuildFihHeaderCore(
+        ProsperoFihVariant variant, ulong pfsImageSize, ulong embeddedCntOffset,
+        long sbOffsetInImage, byte[]? gameDigest, Func<byte[]> fallbackImageDigest,
+        System.Collections.Generic.List<string>? warnings, byte[]? nestedImageDigest,
+        long nestedImageSize, long nestedMetaBaseBlocks, uint nwonlyContentVersionHi,
+        int nwonlyInnerContentInodes, int nwonlyAppFileCount, long nwonlyNdblock,
+        long? innerStoredBlockCount = null, bool explicitNwonly = false)
     {
         byte[] h = new byte[ProsperoPkgLayout.FihHeaderRegionSize];
 
@@ -233,7 +271,6 @@ public static class ProsperoFihBuilder
         // The FIH also records the
         // superblock's absolute offset (0x20) and size (0x28) so the loader can locate the hashed
         // block. See ProsperoImageDigests for the full digest construction.
-        var (sbOffsetInImage, gameDigest) = ProsperoImageDigests.ComputeSblockDigestFromImage(image);
         if (sbOffsetInImage >= 0 && gameDigest is not null)
         {
             ulong sbAbsoluteOffset = (ulong)ProsperoPkgLayout.FihHeaderRegionSize + (ulong)sbOffsetInImage;
@@ -260,8 +297,8 @@ public static class ProsperoFihBuilder
             if (sbBlockIndex >= 1 && (long)sbOffsetInImage % blockSize == 0 &&
                 (long)pfsImageSize % blockSize == 0 && totalBlocks > sbBlockIndex)
             {
-                bool nwonly = nwonlyInnerContentInodes > 0;
-                uint innerBlocks = (uint)(sbBlockIndex - 1);
+                bool nwonly = explicitNwonly || nwonlyInnerContentInodes > 0;
+                uint innerBlocks = checked((uint)(innerStoredBlockCount ?? (sbBlockIndex - 1)));
                 // 0x94/0x98: the inner content-inode count for the data-first nwonly image: dirs and files
                 // below uroot. The legacy non-nwonly path keeps its outer meta-block count.
                 //
@@ -289,7 +326,8 @@ public static class ProsperoFihBuilder
 
                 // 0xF0/0xF8: outer-PFS inode accounting. 0xF0 = app-payload (non-sce_sys) file count;
                 // 0xF8 = flat-path-table accounting value.
-                uint outerFileCount = nwonly && nwonlyAppFileCount > 0 ? (uint)nwonlyAppFileCount : ProsperoPkgLayout.FihOuterFileCount;
+                uint outerFileCount = explicitNwonly ? (uint)nwonlyAppFileCount
+                    : nwonly && nwonlyAppFileCount > 0 ? (uint)nwonlyAppFileCount : ProsperoPkgLayout.FihOuterFileCount;
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihOuterFileCountField), outerFileCount);
                 BinaryPrimitives.WriteUInt32LittleEndian(h.AsSpan(ProsperoPkgLayout.FihFlatPathTableBlockCountField), ProsperoPkgLayout.FihFlatPathTableBlockCount);
             }
@@ -299,15 +337,14 @@ public static class ProsperoFihBuilder
                 "superblock; the superblock offset/size are recorded at 0x20/0x28. The CNT package-digest " +
                 "(CNT+0xFE0), content/header/system/param/playgo GeneralDigests and the per-entry digest " +
                 "table are SHA3-256 of the plaintext CNT regions and entries. The FIH " +
-                "0xB0 slot holds the nested-image-content digest: SHA3-256 of the uncompressed inner PFS " +
-                "image when the builder threads it in, otherwise a fallback " +
+                "0xB0 slot holds SHA3-256 of the NAPS layout when the builder threads it in, otherwise a fallback " +
                 "SHA3-256 of the outer image.");
         }
         else
         {
             // No data-first plaintext superblock in this image (e.g. the legacy zlib inner path):
             // fall back to a well-formed, parseable best-effort game-digest.
-            byte[] fallback = ProsperoImageDigests.Sha3_256(image);
+            byte[] fallback = fallbackImageDigest();
             CopyDigest(h, 0x30, fallback);
             CopyDigest(h, 0x70, fallback);
             CopyDigest(h, 0xD0, fallback);
@@ -323,7 +360,7 @@ public static class ProsperoFihBuilder
         // Cycle-free either way: the naps is final before the CNT digest table is computed.
         CopyDigest(h, 0xB0, nestedImageDigest is { Length: 32 }
             ? nestedImageDigest
-            : ProsperoImageDigests.Sha3_256(image));
+            : fallbackImageDigest());
 
         return h;
     }
