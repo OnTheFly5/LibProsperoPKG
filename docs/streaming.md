@@ -275,6 +275,26 @@ The existing C ABI compatibility proof and independent 5,201 native SHA3 checks
 also passed. Linux and remote workflow results must be checked independently.
 
 
+## Source catalog
+
+`ProsperoStreamingFolderSource.Inspect` catalogs the original folder without
+building overlays. `ProsperoSourceCatalog` also accepts provider-supplied
+absolute slash-separated paths, explicit directories, lengths, reader factories
+and mutation validators. Paths use the current ASCII profile; collisions,
+missing parents and file/directory conflicts are rejected. Reads enforce the
+declared length and invoke the provider validator before opening and at EOF.
+`Validate()` checks the whole captured tree, including empty directories.
+Providers must implement their own mutation detection and keep the source stable.
+The folder provider rejects links and detects ordinary size and timestamp changes,
+but cannot detect replacements that restore all recorded metadata.
+
+`WriteStreaming(options, catalog, output)` uses a catalog for payloads and bounded
+CNT metadata without a source folder. Both this overload and folder generation
+use the same prepared-file filtering, ELF rejection and bounded in-memory
+auxiliary overlays. Empty directories are retained by the catalog but are not
+yet emitted into the inner image. Cataloging and generation do not modify the
+source or stage payloads on disk.
+
 ## Transport-neutral prepared-folder output
 
 `ProsperoPkgBuilder.WriteStreaming(options, output)` accepts

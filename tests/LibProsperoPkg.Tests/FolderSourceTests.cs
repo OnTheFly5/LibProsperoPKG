@@ -11,6 +11,7 @@ internal static class FolderSourceTests
     private static readonly string Passcode = new('0', 32);
     internal static void Run()
     {
+        GenericCatalog();
         CatalogAndOverlays();
         SuppliedAuxiliaryWins();
         InvalidInputsAndChanges();
@@ -42,12 +43,46 @@ internal static class FolderSourceTests
         return bytes.ToArray();
     }
 
+    private static void GenericCatalog()
+    {
+        bool changed = false;
+        ProsperoSourceDirectory Dir(string path) => new() { Path = path, Validate = () => { } };
+        ProsperoSourceFile File(string path, long length, byte[] data) => new()
+        {
+            Path = path, Length = length, OpenRead = () => new MemoryStream(data, writable: false),
+            Validate = () => { if (changed) throw new InvalidDataException("mutated"); },
+        };
+        var catalog = new ProsperoSourceCatalog(new[] { Dir("/empty"), Dir("/data") },
+            new[] { File("/data/a", 3, new byte[] { 1, 2, 3 }) });
+        Program.Equal(2, catalog.Directories.Count, "generic catalog preserves empty directory");
+        using (var reader = catalog.Files[0].OpenRead())
+        {
+            byte[] data = new byte[3]; reader.ReadExactly(data);
+            Same(new byte[] { 1, 2, 3 }, data, "generic reader bytes");
+            changed = true;
+            Program.Throws<InvalidDataException>(() => reader.ReadByte());
+        }
+        Program.Throws<InvalidDataException>(() => catalog.Files[0].OpenRead());
+        changed = false;
+        Program.Throws<ArgumentException>(() => new ProsperoSourceCatalog(new[] { Dir("/data"), Dir("/DATA") }, Array.Empty<ProsperoSourceFile>()));
+        Program.Throws<ArgumentException>(() => new ProsperoSourceCatalog(new[] { Dir("/data") }, new[] { File("/DATA/a", 0, Array.Empty<byte>()) }));
+        Program.Throws<ArgumentException>(() => new ProsperoSourceCatalog(Array.Empty<ProsperoSourceDirectory>(), new[] { File("/a/b", 0, Array.Empty<byte>()) }));
+        Program.Throws<ArgumentException>(() => new ProsperoSourceCatalog(Array.Empty<ProsperoSourceDirectory>(), new[] { File("/../a", 0, Array.Empty<byte>()) }));
+        foreach (var (length, data) in new[] { (2L, new byte[] { 1 }), (1L, new byte[] { 1, 2 }) })
+        {
+            var invalid = new ProsperoSourceCatalog(Array.Empty<ProsperoSourceDirectory>(), new[] { File("/a", length, data) });
+            using var reader = invalid.Files[0].OpenRead();
+            Program.Throws<InvalidDataException>(() => reader.CopyTo(Stream.Null));
+        }
+    }
+
     private static void CatalogAndOverlays()
     {
         string root = CreateFolder();
         try
         {
             Directory.CreateDirectory(Path.Combine(root, "data"));
+            Directory.CreateDirectory(Path.Combine(root, "empty"));
             byte[] data = new byte[0x40000 + 17]; new Random(42).NextBytes(data);
             File.WriteAllBytes(Path.Combine(root, "data", "asset.bin"), data);
             File.WriteAllText(Path.Combine(root, "ignored.gp5"), "project");
@@ -60,6 +95,11 @@ internal static class FolderSourceTests
             var before = Snapshot(root);
             var catalog = ProsperoStreamingFolderSource.Create(root, Passcode);
             Program.Equal(Path.GetFullPath(root), catalog.SourceFolder, "folder canonical path");
+            Program.Equal(true, catalog.Catalog.Directories.Any(d => d.Path == "/empty"), "empty directory cataloged");
+            Program.Equal(true, catalog.Catalog.Files.Any(f => f.Path == "/sce_sys/param.json"), "CNT metadata cataloged");
+            catalog.Catalog.Validate();
+            using (var original = catalog.Catalog.Files.Single(f => f.Path == "/data/asset.bin").OpenRead())
+            using (var bytes = new MemoryStream()) { original.CopyTo(bytes); Same(data, bytes.ToArray(), "catalog original bytes"); }
             Program.Equal(false, catalog.Files.Any(f => f.Path.EndsWith("param.json") || f.Path.EndsWith("icon0.png") || f.Path.EndsWith("gp5")), "CNT/project files excluded");
             Same(data, Read(catalog.Files.Single(f => f.Path == "/data/asset.bin")), "folder payload bytes unchanged");
             byte[] keystone = Read(catalog.Files.Single(f => f.Path == "/sce_sys/keystone"));
@@ -112,6 +152,8 @@ internal static class FolderSourceTests
         try
         {
             Program.Throws<ArgumentException>(() => ProsperoStreamingFolderSource.Create(root, "short"));
+            var inspected = ProsperoStreamingFolderSource.Inspect(root);
+            Program.Equal(true, inspected.Files.Any(f => f.Path == "/sce_sys/param.json"), "inspection needs no package options");
             using var cts = new CancellationTokenSource(); cts.Cancel();
             Program.Throws<OperationCanceledException>(() => ProsperoStreamingFolderSource.Create(root, Passcode, cts.Token));
             string asset = Path.Combine(root, "asset.bin");
@@ -119,6 +161,7 @@ internal static class FolderSourceTests
             var catalog = ProsperoStreamingFolderSource.Create(root, Passcode);
             File.AppendAllText(asset, "changed");
             Program.Throws<InvalidDataException>(() => catalog.Files.Single(f => f.Path == "/asset.bin").OpenRead());
+            Program.Throws<InvalidDataException>(() => catalog.Catalog.Validate());
             File.WriteAllBytes(asset, new byte[20]);
             var stable = ProsperoStreamingFolderSource.Create(root, Passcode);
             using var reader = stable.Files.Single(f => f.Path == "/asset.bin").OpenRead();

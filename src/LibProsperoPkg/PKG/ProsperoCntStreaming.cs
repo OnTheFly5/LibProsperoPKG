@@ -35,7 +35,7 @@ public static partial class ProsperoPkgBuilder
         ArgumentNullException.ThrowIfNull(outer);
         if (props.ContentId is not { Length: 36 } || props.Passcode is not { Length: 32 })
             throw new ArgumentException("Content id and passcode must contain 36 and 32 characters respectively.", nameof(props));
-        if (string.IsNullOrWhiteSpace(props.SourceFolder) || !Directory.Exists(props.SourceFolder))
+        if (!metadataSnapshotOnly && (string.IsNullOrWhiteSpace(props.SourceFolder) || !Directory.Exists(props.SourceFolder)))
             throw new ArgumentException("Prepared source folder does not exist.", nameof(props));
         if (!Enum.IsDefined(props.VolumeType)) throw new ArgumentException("Unsupported volume type.", nameof(props));
         if (imageSeed.Length != 16) throw new ArgumentException("Image seed must contain 16 bytes.", nameof(imageSeed));
@@ -47,7 +47,7 @@ public static partial class ProsperoPkgBuilder
         long total = checked(BlockSize + outer.PfsSize);
         long first = checked((long)outer.FileBlockCount[0] * BlockSize);
         long mchunk0 = first > 0 && first < total ? first : total - BlockSize;
-        var pkg = BuildContainer(props, ekpfs, Path.GetFullPath(props.SourceFolder), (ulong)outer.PfsSize,
+        var pkg = BuildContainer(props, ekpfs, string.IsNullOrWhiteSpace(props.SourceFolder) ? "." : Path.GetFullPath(props.SourceFolder), (ulong)outer.PfsSize,
             checked(outer.BlockCount * ProsperoImageDigests.DigestSize), playgoFileCount,
             (ulong)mchunk0, (ulong)(total - mchunk0), overrides, metadataSnapshotOnly);
         return FinalizeEmbeddedContainer(pkg, props, outer, fih, seed, overrides);
@@ -134,7 +134,7 @@ public static partial class ProsperoPkgBuilder
         metadata.Position = 0x1000;
         metadata.Write(pkg.HeaderSignature);
         byte[]? param = overrides.TryGetValue("param.json", out var bytes) ? bytes : null;
-        var xml = BuildSiXmlOptionsFromSeed(pkg, seed.ToArray(), Path.GetFullPath(props.SourceFolder), param);
+        var xml = BuildSiXmlOptionsFromSeed(pkg, seed.ToArray(), string.IsNullOrWhiteSpace(props.SourceFolder) ? "." : Path.GetFullPath(props.SourceFolder), param);
         if (metadata.Length != containerSize || buffer.LongLength != containerSize)
             throw new InvalidDataException("CNT serialization exceeded its metadata reservation.");
         return new ProsperoEmbeddedCntResult

@@ -16,7 +16,8 @@ namespace LibProsperoPkg.PKG;
 /// <summary>Options for prepared-folder debug FPKG generation without intermediate images.</summary>
 public sealed class ProsperoStreamingPackageOptions
 {
-    public required string SourceFolder { get; init; }
+    /// <summary>Required for folder generation; unused by the catalog overload.</summary>
+    public string SourceFolder { get; init; } = "";
     /// <summary>Local destination for BuildLocalStreaming; an opaque result label for WriteStreaming.</summary>
     public required string OutputPath { get; init; }
     /// <summary>Defaults to the supplied param.json contentId. An override is applied only in memory.</summary>
@@ -95,25 +96,37 @@ public static partial class ProsperoPkgBuilder
         return PrepareStreamingPackage(options, options.OutputPath, progress, cancellationToken)(output);
     }
 
-    private static Func<IProsperoStreamingPackageOutput, ProsperoStreamingPackageResult> PrepareStreamingPackage(
-        ProsperoStreamingPackageOptions options, string outputPath,
-        Action<ProsperoStreamingProgress>? progress, CancellationToken cancellationToken)
+    /// <summary>Generate from a caller-provided source catalog, without using SourceFolder.</summary>
+    public static ProsperoStreamingPackageResult WriteStreaming(ProsperoStreamingPackageOptions options,
+        ProsperoSourceCatalog source, IProsperoStreamingPackageOutput output,
+        Action<ProsperoStreamingProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.SourceFolder);
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(output);
+        return PrepareStreamingPackage(options, options.OutputPath, progress, cancellationToken, source)(output);
+    }
+
+    private static Func<IProsperoStreamingPackageOutput, ProsperoStreamingPackageResult> PrepareStreamingPackage(
+        ProsperoStreamingPackageOptions options, string outputPath,
+        Action<ProsperoStreamingProgress>? progress, CancellationToken cancellationToken, ProsperoSourceCatalog? source = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (source is null) ArgumentException.ThrowIfNullOrWhiteSpace(options.SourceFolder);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.OutputPath);
         if (options.Passcode is not { Length: 32 }) throw new ArgumentException("Passcode must contain 32 characters.", nameof(options));
         if (!Enum.IsDefined(options.VolumeType)) throw new ArgumentOutOfRangeException(nameof(options));
         if (options.ImageSeed is not null && options.ImageSeed.Length != 16)
             throw new ArgumentException("Image seed must contain 16 bytes.", nameof(options));
-        string sourceFolder = Path.GetFullPath(options.SourceFolder);
+        string sourceFolder = source is null ? Path.GetFullPath(options.SourceFolder) : "";
         cancellationToken.ThrowIfCancellationRequested();
         progress?.Invoke(new("Inspecting source", 0));
-        var catalog = ProsperoStreamingFolderSource.Create(sourceFolder, options.Passcode, cancellationToken);
-        if (options.VolumeType == ProsperoVolumeType.Application && !catalog.Files.Any(f => f.Path == "/eboot.bin"))
+        var catalog = source ?? ProsperoStreamingFolderSource.Inspect(sourceFolder, cancellationToken);
+        var innerFiles = ProsperoStreamingCatalogSource.Create(catalog, options.Passcode, cancellationToken);
+        if (options.VolumeType == ProsperoVolumeType.Application && !innerFiles.Any(f => f.Path == "/eboot.bin"))
             throw new InvalidDataException("Prepared application source requires eboot.bin.");
         var overrides = SnapshotStreamingOverrides(options.MetadataOverrides);
-        SnapshotStreamingMetadata(sourceFolder, overrides, cancellationToken);
+        SnapshotStreamingMetadata(catalog, overrides, cancellationToken);
         byte[] paramBytes = overrides.TryGetValue("param.json", out var supplied)
             ? supplied : throw new FileNotFoundException("Prepared source requires sce_sys/param.json.");
         if (paramBytes.Length > 4 * 1024 * 1024) throw new InvalidDataException("param.json exceeds the 4 MiB metadata limit.");
@@ -152,7 +165,7 @@ public static partial class ProsperoPkgBuilder
                 {
                     Name = "pfs_image.dat", WritePayload = sink =>
                     {
-                        inner = assembler.Write(sink, catalog.Files, token);
+                        inner = assembler.Write(sink, innerFiles, token);
                         return checked(inner.Ndblock * BlockSize);
                     },
                 },
@@ -222,7 +235,7 @@ public static partial class ProsperoPkgBuilder
             {
                 OutputPath = outputPath, ContentId = contentId, PackageSize = packageSize,
                 MountSize = mountSize, PfsSize = outer.PfsSize, InnerStoredSize = layout.OutputLength,
-                InnerLogicalSize = checked(layout.Ndblock * BlockSize), SourceFileCount = catalog.Files.Count,
+                InnerLogicalSize = checked(layout.Ndblock * BlockSize), SourceFileCount = innerFiles.Count,
             };
         };
     }
@@ -244,49 +257,31 @@ public static partial class ProsperoPkgBuilder
 
     // Freeze small CNT inputs before writing payloads. Construction must never fall back to disk:
     // a changed/new media file could otherwise be a link to the growing output or an unbounded file.
-    private static void SnapshotStreamingMetadata(string folder, Dictionary<string, byte[]> snapshot,
+    private static void SnapshotStreamingMetadata(ProsperoSourceCatalog catalog, Dictionary<string, byte[]> snapshot,
         CancellationToken token)
     {
         const long limit = 64 * 1024 * 1024;
         long total = snapshot.Values.Sum(bytes => (long)bytes.Length);
-        void Walk(string directory, string prefix)
+        catalog.Validate();
+        foreach (var file in catalog.Files)
         {
             token.ThrowIfCancellationRequested();
-            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("Symbolic metadata directories are not supported.");
-            foreach (string path in Directory.EnumerateFileSystemEntries(directory))
-            {
-                token.ThrowIfCancellationRequested();
-                var attributes = File.GetAttributes(path);
-                if ((attributes & FileAttributes.ReparsePoint) != 0)
-                    throw new IOException("Symbolic metadata paths are not supported.");
-                string relative = prefix + Path.GetFileName(path);
-                if ((attributes & FileAttributes.Directory) != 0) { Walk(path, relative + "/"); continue; }
-                bool param = relative == "param.json";
-                if (!param && !ProsperoCntEntryNames.NameToId.ContainsKey(relative)) continue;
-                // These descriptor entries are regenerated from actual image geometry.
-                if (relative is "imagedigs.dat" or "playgo-chunk.dat" or "playgo-hash-table.dat" or "playgo-ficm.dat") continue;
-                if (snapshot.ContainsKey(relative)) continue;
-                var before = new FileInfo(path);
-                long length = before.Length;
-                DateTime modified = before.LastWriteTimeUtc;
-                long available = param ? Math.Min(limit - total, 4 * 1024 * 1024) : limit - total;
-                if (length < 0 || length > available)
-                    throw new InvalidDataException("CNT source metadata exceeds its bounded snapshot budget: " + relative);
-                using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                if (source.Length != length) throw new IOException("Source metadata changed before inspection.");
-                byte[] bytes = new byte[checked((int)length)];
-                source.ReadExactly(bytes);
-                if (source.ReadByte() != -1) throw new IOException("Source metadata grew during inspection.");
-                var after = new FileInfo(path);
-                if (after.Length != length || after.LastWriteTimeUtc != modified ||
-                    (after.Attributes & FileAttributes.ReparsePoint) != 0)
-                    throw new IOException("Source metadata changed during inspection.");
-                total += length;
-                snapshot.Add(relative, bytes);
-            }
+            if (!file.Path.StartsWith("/sce_sys/", StringComparison.Ordinal)) continue;
+            string relative = file.Path[9..];
+            bool param = relative == "param.json";
+            if (!param && !ProsperoCntEntryNames.NameToId.ContainsKey(relative)) continue;
+            if (relative is "imagedigs.dat" or "playgo-chunk.dat" or "playgo-hash-table.dat" or "playgo-ficm.dat") continue;
+            if (snapshot.ContainsKey(relative)) continue;
+            long available = param ? Math.Min(limit - total, 4 * 1024 * 1024) : limit - total;
+            if (file.Length > available)
+                throw new InvalidDataException("CNT source metadata exceeds its bounded snapshot budget: " + relative);
+            using var reader = file.OpenRead();
+            byte[] bytes = new byte[checked((int)file.Length)];
+            reader.ReadExactly(bytes);
+            if (reader.ReadByte() != -1) throw new InvalidDataException("Source metadata grew during inspection.");
+            total += file.Length;
+            snapshot.Add(relative, bytes);
         }
-        Walk(Path.Combine(folder, "sce_sys"), "");
     }
 
     private static void RequireOutputOutsideSource(string source, string output)

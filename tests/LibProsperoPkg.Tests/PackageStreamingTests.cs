@@ -320,6 +320,42 @@ internal static class PackageStreamingTests
                 int fixedExtent = checked((int)(B + result.PfsSize));
                 Same(expected.AsSpan(0, fixedExtent), actual.AsSpan(0, fixedExtent), "callback FIH/PFS matches local bytes");
                 VerifyPackage(actual, source, result, kraken);
+                var directories = Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories)
+                    .Select(path => new ProsperoSourceDirectory
+                    {
+                        Path = "/" + Path.GetRelativePath(source, path).Replace('\\', '/'), Validate = () => { },
+                    }).ToArray();
+                bool genericChanged = false;
+                var genericFiles = Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories)
+                    .Select(path =>
+                    {
+                        byte[] bytes = File.ReadAllBytes(path);
+                        return new ProsperoSourceFile
+                        {
+                            Path = "/" + Path.GetRelativePath(source, path).Replace('\\', '/'), Length = bytes.Length,
+                            OpenRead = () => new MemoryStream(bytes, writable: false),
+                            Validate = () => { if (genericChanged) throw new InvalidDataException("source changed"); },
+                        };
+                    }).ToArray();
+                var generic = new ProsperoSourceCatalog(directories, genericFiles);
+                using var genericSink = new CallbackSink();
+                var genericResult = ProsperoPkgBuilder.WriteStreaming(new ProsperoStreamingPackageOptions
+                {
+                    OutputPath = "in-memory-source", UseKraken = kraken,
+                    ImageSeed = new byte[16], Timestamp = DateTimeOffset.FromUnixTimeSeconds(12345678),
+                }, generic, genericSink);
+                byte[] genericPackage = genericSink.Bytes.ToArray();
+                Same(expected.AsSpan(0, fixedExtent), genericPackage.AsSpan(0, fixedExtent), "generic source produces identical FIH/PFS");
+                VerifyPackage(genericPackage, source, genericResult, kraken);
+                using (var failedSink = new CallbackSink())
+                {
+                    Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.WriteStreaming(new ProsperoStreamingPackageOptions
+                    {
+                        OutputPath = "mutated", UseKraken = kraken,
+                    }, generic, failedSink, progress: p => { if (p.Stage == "Writing PFS") genericChanged = true; }));
+                    Program.Equal(0, failedSink.AppendsAfterHash, "mutated generic source does not append SI");
+                }
+                genericChanged = false;
                 Program.Equal(reference.PackageSize, result.PackageSize, "callback summary package size");
                 Program.Equal(label, result.OutputPath, "generic output label preserved");
                 Program.Equal(true, sink.Hashed && sink.AppendsAfterHash > 0, "SI appended only after hashing");
