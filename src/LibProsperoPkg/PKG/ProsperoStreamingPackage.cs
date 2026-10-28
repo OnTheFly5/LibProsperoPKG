@@ -13,10 +13,11 @@ using System.Threading;
 
 namespace LibProsperoPkg.PKG;
 
-/// <summary>Options for folder-to-local debug FPKG generation without intermediate images.</summary>
+/// <summary>Options for prepared-folder debug FPKG generation without intermediate images.</summary>
 public sealed class ProsperoStreamingPackageOptions
 {
     public required string SourceFolder { get; init; }
+    /// <summary>Local destination for BuildLocalStreaming; an opaque result label for WriteStreaming.</summary>
     public required string OutputPath { get; init; }
     /// <summary>Defaults to the supplied param.json contentId. An override is applied only in memory.</summary>
     public string? ContentId { get; init; }
@@ -32,7 +33,10 @@ public sealed class ProsperoStreamingPackageOptions
 
 public readonly record struct ProsperoStreamingProgress(string Stage, long BytesWritten);
 
-/// <summary>Summary of a fully published local package; retains no payload or block tables.</summary>
+/// <summary>
+/// Generated package summary, retaining no payload or block tables. BuildLocalStreaming returns
+/// after publication; WriteStreaming leaves validation/publication to its caller.
+/// </summary>
 public sealed class ProsperoStreamingPackageResult
 {
     public required string OutputPath { get; init; }
@@ -59,13 +63,50 @@ public static partial class ProsperoPkgBuilder
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.SourceFolder);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.OutputPath);
+        string outputPath = Path.GetFullPath(options.OutputPath);
+        RequireOutputOutsideSource(Path.GetFullPath(options.SourceFolder), outputPath);
+        var generate = PrepareStreamingPackage(options, outputPath, progress, cancellationToken);
+        return ProsperoLocalPackageOutput.Write(outputPath, (file, token) =>
+        {
+            var result = generate(new LocalStreamingPackageOutput(file));
+            token.ThrowIfCancellationRequested();
+            progress?.Invoke(new("Validating package", result.PackageSize));
+            var report = ProsperoPkgValidator.Validate(ProsperoPkgReader.Read(file), result.ContentId);
+            if (!report.Accepted)
+                throw new InvalidDataException("Generated package failed structural validation: " +
+                    string.Join("; ", report.Checks.Where(c => c.Status == ProsperoCheckStatus.Fail).Select(c => c.Detail)));
+            token.ThrowIfCancellationRequested();
+            return result;
+        }, confirmDeleteExistingPart, cancellationToken);
+    }
+
+    /// <summary>
+    /// Generates a prepared-folder package through append/patch/integrity operations. OutputPath is
+    /// only a result label here, never a local path opened by this method. The caller owns exclusive
+    /// output creation, source/output separation, validation, publication and failure cleanup.
+    /// A returned summary means generation completed, not that a remote package was published.
+    /// </summary>
+    public static ProsperoStreamingPackageResult WriteStreaming(ProsperoStreamingPackageOptions options,
+        IProsperoStreamingPackageOutput output, Action<ProsperoStreamingProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(output);
+        return PrepareStreamingPackage(options, options.OutputPath, progress, cancellationToken)(output);
+    }
+
+    private static Func<IProsperoStreamingPackageOutput, ProsperoStreamingPackageResult> PrepareStreamingPackage(
+        ProsperoStreamingPackageOptions options, string outputPath,
+        Action<ProsperoStreamingProgress>? progress, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.SourceFolder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.OutputPath);
         if (options.Passcode is not { Length: 32 }) throw new ArgumentException("Passcode must contain 32 characters.", nameof(options));
         if (!Enum.IsDefined(options.VolumeType)) throw new ArgumentOutOfRangeException(nameof(options));
         if (options.ImageSeed is not null && options.ImageSeed.Length != 16)
             throw new ArgumentException("Image seed must contain 16 bytes.", nameof(options));
         string sourceFolder = Path.GetFullPath(options.SourceFolder);
-        string outputPath = Path.GetFullPath(options.OutputPath);
-        RequireOutputOutsideSource(sourceFolder, outputPath);
         cancellationToken.ThrowIfCancellationRequested();
         progress?.Invoke(new("Inspecting source", 0));
         var catalog = ProsperoStreamingFolderSource.Create(sourceFolder, options.Passcode, cancellationToken);
@@ -95,8 +136,10 @@ public static partial class ProsperoPkgBuilder
             TimeStamp = options.Timestamp.UtcDateTime, VolumeType = options.VolumeType,
         };
         var assembler = new ProsperoPs5InnerImageAssembler(seconds, 0, options.UseKraken);
-        return ProsperoLocalPackageOutput.Write(outputPath, (file, token) =>
+        return output =>
         {
+            var token = cancellationToken;
+            using var file = new StreamingPackageAppendStream(output, token);
             // Reserve only the fixed FIH block. All variable-sized metadata follows the data-first PFS.
             file.Write(new byte[BlockSize]);
             progress?.Invoke(new("Writing PFS", file.Position));
@@ -145,13 +188,20 @@ public static partial class ProsperoPkgBuilder
             if (file.Position != cntOffset) throw new InvalidDataException("Unexpected streamed outer image length.");
             file.Write(container.Bytes);
             long mountSize = file.Position;
-            file.Position = 0;
-            file.Write(fih);
             file.Flush();
-            file.Position = 0;
+            for (int offset = 0; offset < fih.Length; offset += 1024)
+            {
+                token.ThrowIfCancellationRequested();
+                output.Patch(offset, fih.AsSpan(offset, Math.Min(1024, fih.Length - offset)));
+            }
+            file.Flush();
             progress?.Invoke(new("Hashing finalized mount", mountSize));
-            var digests = ProsperoFinalizedMountDigests.Compute(file, mountSize,
-                checked((outer.SuperblockIndex + 1L) * BlockSize), cancellationToken: token);
+            var digests = output.FinalizeMount(mountSize,
+                checked((outer.SuperblockIndex + 1L) * BlockSize), token);
+            if (digests is null || digests.Length != mountSize)
+                throw new InvalidDataException("Output integrity metadata does not cover the finalized mount.");
+            if (!digests.SuperblockDigest.Span.SequenceEqual(outer.GetBlockDigest(outer.SuperblockIndex).Span))
+                throw new InvalidDataException("Output integrity metadata has an unexpected superblock digest.");
             token.ThrowIfCancellationRequested();
             container.Xml.NestedInnerLayout = layout;
             container.Xml.ChunkInfo = new ProsperoChunkInfoModel
@@ -167,11 +217,6 @@ public static partial class ProsperoPkgBuilder
             file.Write(si);
             long packageSize = file.Position;
             file.Flush();
-            progress?.Invoke(new("Validating package", packageSize));
-            var report = ProsperoPkgValidator.Validate(ProsperoPkgReader.Read(file), contentId);
-            if (!report.Accepted)
-                throw new InvalidDataException("Generated package failed structural validation: " +
-                    string.Join("; ", report.Checks.Where(c => c.Status == ProsperoCheckStatus.Fail).Select(c => c.Detail)));
             token.ThrowIfCancellationRequested();
             return new ProsperoStreamingPackageResult
             {
@@ -179,7 +224,7 @@ public static partial class ProsperoPkgBuilder
                 MountSize = mountSize, PfsSize = outer.PfsSize, InnerStoredSize = layout.OutputLength,
                 InnerLogicalSize = checked(layout.Ndblock * BlockSize), SourceFileCount = catalog.Files.Count,
             };
-        }, confirmDeleteExistingPart, cancellationToken);
+        };
     }
 
     private static Dictionary<string, byte[]> SnapshotStreamingOverrides(IReadOnlyDictionary<string, byte[]>? source)

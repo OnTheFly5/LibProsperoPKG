@@ -16,6 +16,7 @@ internal static class PackageStreamingTests
     internal static void Run()
     {
         FolderToPackage();
+        CallbackOutput();
         FailedJobsLeaveNoOutput();
         FrozenMetadataAndBudgets();
     }
@@ -98,11 +99,16 @@ internal static class PackageStreamingTests
 
     private static void VerifyPackage(string target, string source, ProsperoStreamingPackageResult result, bool kraken)
     {
-        var parsed = ProsperoPkgReader.Read(target);
+        VerifyPackage(File.ReadAllBytes(target), source, result, kraken);
+    }
+
+    private static void VerifyPackage(byte[] package, string source, ProsperoStreamingPackageResult result, bool kraken)
+    {
+        using var packageReader = new MemoryStream(package, writable: false);
+        var parsed = ProsperoPkgReader.Read(packageReader);
         Program.Equal(ProsperoPkgType.FullDebug, parsed.Type, "full FIH package parsed");
         Program.Equal(Id, parsed.Header!.ContentId, "source content id used");
         Program.Equal(true, ProsperoPkgValidator.Validate(parsed, Id).Accepted, "structural acceptance gate");
-        byte[] package = File.ReadAllBytes(target); // small test fixture only; production never materializes it
         int sbIndex = checked((int)(BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20)) / B - 1));
         int innerBlocks = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(package.AsSpan(0x90)));
         byte[] outer = package.AsSpan(B, (int)result.PfsSize).ToArray();
@@ -228,6 +234,126 @@ internal static class PackageStreamingTests
                 SourceFolder = source, OutputPath = rejected,
             }));
             Program.Equal(false, File.Exists(rejected) || File.Exists(rejected + ".part"), "oversized metadata rejected before output creation");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private sealed class CallbackSink : IProsperoStreamingPackageOutput, IDisposable
+    {
+        // Small fixture-only backing store. The production contract exposes no read/seek API.
+        internal readonly MemoryStream Bytes = new();
+        internal string? FailAt;
+        internal bool BadLength, BadRoot;
+        internal bool Hashed;
+        internal int Patches, AppendsAfterHash;
+        private bool pendingAppend;
+        private void Fail(string operation)
+        {
+            if (FailAt == operation) throw new IOException("Injected " + operation + " failure");
+        }
+        public void Append(ReadOnlySpan<byte> bytes)
+        {
+            Fail("append");
+            Program.Equal(true, bytes.Length <= B, "callback append is bounded");
+            if (Hashed) AppendsAfterHash++;
+            Bytes.Write(bytes);
+            pendingAppend = true;
+        }
+        public void Flush() { Fail("flush"); pendingAppend = false; }
+        public void Patch(long offset, ReadOnlySpan<byte> bytes)
+        {
+            Fail("patch");
+            Program.Equal(false, pendingAppend, "upload finished before positional patches");
+            Program.Equal(false, Hashed, "patches precede mount hashing");
+            Program.Equal(true, bytes.Length <= 1024, "callback patch matches PWRITE cap");
+            Program.Equal((long)Patches * 1024, offset, "ordered FIH patch coverage");
+            long position = Bytes.Position;
+            Bytes.Position = offset;
+            Bytes.Write(bytes);
+            Bytes.Position = position;
+            Patches++;
+        }
+        public ProsperoFinalizedMountDigests FinalizeMount(long length, long superblockOffset,
+            CancellationToken token)
+        {
+            Fail("hash");
+            Program.Equal(false, pendingAppend, "patches flushed before hashing");
+            Program.Equal(64, Patches, "entire FIH patched before hashing");
+            Program.Equal(length, Bytes.Length, "SI absent during hashing");
+            Hashed = true;
+            Bytes.Position = 0;
+            var digests = ProsperoFinalizedMountDigests.Compute(Bytes, length, superblockOffset,
+                cancellationToken: token);
+            if (BadLength) return new ProsperoFinalizedMountDigests(1, new byte[32], new byte[32], new byte[4]);
+            if (BadRoot) return new ProsperoFinalizedMountDigests(length, digests.MountDigest.Span,
+                new byte[32], digests.PlayGoChunkCrc.Span);
+            return digests;
+        }
+        public void Dispose() => Bytes.Dispose();
+    }
+
+    private static void CallbackOutput()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-output-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            var snapshot = Snapshot(source);
+            ProsperoStreamingPackageOptions Options(string output, bool kraken) => new()
+            {
+                SourceFolder = source, OutputPath = output, UseKraken = kraken,
+                ImageSeed = new byte[16], Timestamp = DateTimeOffset.FromUnixTimeSeconds(12345678),
+            };
+            foreach (bool kraken in new[] { false, true })
+            {
+                string local = Path.Combine(root, "reference.pkg");
+                var reference = ProsperoPkgBuilder.BuildLocalStreaming(Options(local, kraken));
+                using var sink = new CallbackSink();
+                // This path must remain a label: the generic writer must not open it on disk.
+                string label = Path.Combine(root, "missing-parent", "remote.pkg");
+                var result = ProsperoPkgBuilder.WriteStreaming(Options(label, kraken), sink);
+                byte[] expected = File.ReadAllBytes(local), actual = sink.Bytes.ToArray();
+                // CNT IMAGE_KEY uses intentionally randomized RSA padding. Its dependent header/SI
+                // digests differ across builds, so compare the deterministic FIH/PFS extent exactly
+                // and independently verify CNT, recovered payloads and SI against their own bytes.
+                int fixedExtent = checked((int)(B + result.PfsSize));
+                Same(expected.AsSpan(0, fixedExtent), actual.AsSpan(0, fixedExtent), "callback FIH/PFS matches local bytes");
+                VerifyPackage(actual, source, result, kraken);
+                Program.Equal(reference.PackageSize, result.PackageSize, "callback summary package size");
+                Program.Equal(label, result.OutputPath, "generic output label preserved");
+                Program.Equal(true, sink.Hashed && sink.AppendsAfterHash > 0, "SI appended only after hashing");
+                Program.Equal(false, Directory.Exists(Path.GetDirectoryName(label)), "generic output performs no local creation");
+                Program.Equal(true, sink.Bytes.CanWrite, "writer leaves caller output open");
+                sink.Bytes.Position = 0;
+                Program.Equal(true, ProsperoPkgValidator.Validate(ProsperoPkgReader.Read(sink.Bytes), Id).Accepted,
+                    "callback output parses and validates");
+                File.Delete(local);
+            }
+            foreach (string failure in new[] { "append", "flush", "patch", "hash" })
+            {
+                using var sink = new CallbackSink { FailAt = failure };
+                Program.Throws<IOException>(() => ProsperoPkgBuilder.WriteStreaming(Options("remote.pkg", false), sink));
+                Program.Equal(0, sink.AppendsAfterHash, "failed output never receives SI");
+                Program.Equal(true, sink.Bytes.CanWrite, "failed output lifetime stays with caller");
+            }
+            foreach (bool badRoot in new[] { false, true })
+            {
+                using var sink = new CallbackSink { BadLength = !badRoot, BadRoot = badRoot };
+                Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.WriteStreaming(Options("remote.pkg", false), sink));
+                Program.Equal(0, sink.AppendsAfterHash, "invalid integrity metadata cannot append SI");
+            }
+            using (var sink = new CallbackSink())
+            using (var cancellation = new CancellationTokenSource())
+            {
+                Program.Throws<OperationCanceledException>(() => ProsperoPkgBuilder.WriteStreaming(Options("remote.pkg", false), sink,
+                    progress: p => { if (p.Stage == "Writing SI") cancellation.Cancel(); }, cancellationToken: cancellation.Token));
+                Program.Equal(0, sink.AppendsAfterHash, "cancellation before SI prevents append");
+                Program.Equal(true, sink.Bytes.CanWrite, "cancellation leaves cleanup to caller");
+            }
+            var after = Snapshot(source);
+            Program.Equal(snapshot.Count, after.Count, "callback builds add no source files");
+            foreach (var (path, value) in snapshot) Program.Equal(value, after[path], "callback build preserves source bytes/times");
         }
         finally { Directory.Delete(root, true); }
     }

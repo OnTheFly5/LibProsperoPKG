@@ -270,6 +270,44 @@ a synthetic 115 MiB image to a sampling sink. Console compatibility remains unve
 The dedicated `tests/LibProsperoPkg.StreamingNativeTests` project links the same
 streaming regressions for NativeAOT, excluding the managed-only legacy XML
 comparison. See its README for publish/run commands. The managed suite passed
-14,093 assertions and the native streaming runner passed 13,799 on macOS arm64.
+15,992 assertions and the native streaming runner passed 15,698 on macOS arm64.
 The existing C ABI compatibility proof and independent 5,201 native SHA3 checks
 also passed. Linux and remote workflow results must be checked independently.
+
+
+## Transport-neutral prepared-folder output
+
+`ProsperoPkgBuilder.WriteStreaming(options, output)` accepts
+`IProsperoStreamingPackageOutput`, with synchronous append, flush, positional patch
+and finalized-mount integrity operations. Append calls carry at most 64 KiB;
+patches carry at most 1024 bytes. The writer does not read or seek its output,
+create a local destination, dispose the caller's sink, or publish a package.
+`OutputPath` is only a result label in this API. The caller owns exclusive output
+creation, source/output separation, cleanup, transport validation and publication.
+
+The exact order is mount append, flush, FIH patches, flush, finalized integrity,
+SI append, flush. A returned summary means generation finished. A transport must
+not report publication until its own completion checks and no-replace operation
+succeed. Sink operations must consume borrowed buffers before returning and throw
+on incomplete writes or failed commands. Cooperative cancellation is checked at
+bounded writes/patches and before SI; blocked transport operations also need their
+own cancellation/timeouts.
+
+`FinalizeMount` must return SHA3-256 of the final mount, the final superblock digest
+and CRC-32C records for its 64 KiB chunks, including a partial tail. A future FTP
+sink can combine server-side SHA3 with locally captured CRCs corrected for patches;
+that accumulator and the FTP adapter are not implemented here. The writer checks
+length and the expected superblock digest before appending SI; it cannot establish
+the provenance of external metadata. Do not emulate a readable/seekable mount by
+buffering or downloading the complete package.
+
+`BuildLocalStreaming` uses the same generator through a local adapter and retains
+its bounded readback, structural validation, exclusive partial ownership,
+non-overwriting publication and cleanup. Its source snapshots still precede
+output creation. Tests compare deterministic FIH/PFS bytes between local and
+callback outputs and recover the original file contents. CNT IMAGE_KEY RSA padding
+is intentionally random between builds, so each CNT and SI is verified against
+its own final mount rather than requiring whole-package byte equality. Tests also
+cover write/flush/patch/hash failures, malformed integrity metadata and cancellation
+before SI. The small callback fixtures use a memory-backed sink only for assertions.
+The callback API is not yet bound to a production C ABI or FTP/RAR transport.
