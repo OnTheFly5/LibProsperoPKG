@@ -1,0 +1,306 @@
+// LibProsperoPkg - A library for building and inspecting PS5 packages.
+// Copyright (C) 2026 SvenGDK
+#nullable enable
+using LibProsperoPkg.Metadata;
+using LibProsperoPkg.PFS;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+
+namespace LibProsperoPkg.PKG;
+
+/// <summary>Options for folder-to-local debug FPKG generation without intermediate images.</summary>
+public sealed class ProsperoStreamingPackageOptions
+{
+    public required string SourceFolder { get; init; }
+    public required string OutputPath { get; init; }
+    /// <summary>Defaults to the supplied param.json contentId. An override is applied only in memory.</summary>
+    public string? ContentId { get; init; }
+    public string Passcode { get; init; } = new('0', 32);
+    public ProsperoVolumeType VolumeType { get; init; } = ProsperoVolumeType.Application;
+    public bool UseKraken { get; init; } = true;
+    public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
+    /// <summary>Optional fixed 16-byte outer seed for reproducible image geometry/encryption.</summary>
+    public byte[]? ImageSeed { get; init; }
+    /// <summary>Small CNT metadata replacements relative to sce_sys; source files remain untouched.</summary>
+    public IReadOnlyDictionary<string, byte[]>? MetadataOverrides { get; init; }
+}
+
+public readonly record struct ProsperoStreamingProgress(string Stage, long BytesWritten);
+
+/// <summary>Summary of a fully published local package; retains no payload or block tables.</summary>
+public sealed class ProsperoStreamingPackageResult
+{
+    public required string OutputPath { get; init; }
+    public required string ContentId { get; init; }
+    public required long PackageSize { get; init; }
+    public required long MountSize { get; init; }
+    public required long PfsSize { get; init; }
+    public required long InnerStoredSize { get; init; }
+    public required long InnerLogicalSize { get; init; }
+    public required int SourceFileCount { get; init; }
+}
+
+public static partial class ProsperoPkgBuilder
+{
+    /// <summary>
+    /// Streams a prepared folder to the selected local .part file, finalizes its CNT/FIH, reads that
+    /// same file once for SI integrity, appends SI, validates structure, and publishes without overwrite.
+    /// Raw executable conversion, RAR, FTP and large-game SI profiles are separate facilities.
+    /// </summary>
+    public static ProsperoStreamingPackageResult BuildLocalStreaming(ProsperoStreamingPackageOptions options,
+        Func<string, bool>? confirmDeleteExistingPart = null,
+        Action<ProsperoStreamingProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.SourceFolder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.OutputPath);
+        if (options.Passcode is not { Length: 32 }) throw new ArgumentException("Passcode must contain 32 characters.", nameof(options));
+        if (!Enum.IsDefined(options.VolumeType)) throw new ArgumentOutOfRangeException(nameof(options));
+        if (options.ImageSeed is not null && options.ImageSeed.Length != 16)
+            throw new ArgumentException("Image seed must contain 16 bytes.", nameof(options));
+        string sourceFolder = Path.GetFullPath(options.SourceFolder);
+        string outputPath = Path.GetFullPath(options.OutputPath);
+        RequireOutputOutsideSource(sourceFolder, outputPath);
+        cancellationToken.ThrowIfCancellationRequested();
+        progress?.Invoke(new("Inspecting source", 0));
+        var catalog = ProsperoStreamingFolderSource.Create(sourceFolder, options.Passcode, cancellationToken);
+        if (options.VolumeType == ProsperoVolumeType.Application && !catalog.Files.Any(f => f.Path == "/eboot.bin"))
+            throw new InvalidDataException("Prepared application source requires eboot.bin.");
+        var overrides = SnapshotStreamingOverrides(options.MetadataOverrides);
+        SnapshotStreamingMetadata(sourceFolder, overrides, cancellationToken);
+        byte[] paramBytes = overrides.TryGetValue("param.json", out var supplied)
+            ? supplied : throw new FileNotFoundException("Prepared source requires sce_sys/param.json.");
+        if (paramBytes.Length > 4 * 1024 * 1024) throw new InvalidDataException("param.json exceeds the 4 MiB metadata limit.");
+        var param = ProsperoParam.Parse(Encoding.UTF8.GetString(paramBytes));
+        string contentId = options.ContentId ?? param.ContentId
+            ?? throw new InvalidDataException("param.json has no contentId; supply one explicitly.");
+        if (contentId.Length != 36) throw new ArgumentException("Content id must contain 36 characters.", nameof(options));
+        if (options.ContentId is not null)
+        {
+            param.ContentId = contentId;
+            paramBytes = Encoding.UTF8.GetBytes(param.ToJson());
+        }
+        overrides["param.json"] = paramBytes;
+        byte[] seed = options.ImageSeed?.ToArray() ?? RandomNumberGenerator.GetBytes(16);
+        byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(contentId, options.Passcode);
+        long seconds = options.Timestamp.ToUnixTimeSeconds();
+        var props = new ProsperoPkgBuildProperties
+        {
+            SourceFolder = sourceFolder, ContentId = contentId, Passcode = options.Passcode,
+            TimeStamp = options.Timestamp.UtcDateTime, VolumeType = options.VolumeType,
+        };
+        var assembler = new ProsperoPs5InnerImageAssembler(seconds, 0, options.UseKraken);
+        return ProsperoLocalPackageOutput.Write(outputPath, (file, token) =>
+        {
+            // Reserve only the fixed FIH block. All variable-sized metadata follows the data-first PFS.
+            file.Write(new byte[BlockSize]);
+            progress?.Invoke(new("Writing PFS", file.Position));
+            ProsperoPs5InnerImageLayout? inner = null;
+            byte[]? naps = null;
+            using var imageOutput = new StreamingImageOutput(file, token, progress);
+            var outer = ProsperoOuterPfsBuilder.WriteForPackage(imageOutput, new[]
+            {
+                new ProsperoOuterFileProducer
+                {
+                    Name = "pfs_image.dat", WritePayload = sink =>
+                    {
+                        inner = assembler.Write(sink, catalog.Files, token);
+                        return checked(inner.Ndblock * BlockSize);
+                    },
+                },
+                new ProsperoOuterFileProducer
+                {
+                    Name = "naps_pkg_layout.dat", Signed = true, WritePayload = sink =>
+                    {
+                        token.ThrowIfCancellationRequested();
+                        naps = ProsperoNwonlyNapsGenerator.Generate(inner!);
+                        sink.Write(naps);
+                        return null;
+                    },
+                },
+            }, new ProsperoOuterPfsBuildParameters { Seed = seed, TimestampSeconds = seconds }, ekpfs, token);
+            token.ThrowIfCancellationRequested();
+            progress?.Invoke(new("Finalizing CNT and FIH", file.Position));
+            var layout = inner!;
+            byte[] fih = ProsperoFihBuilder.BuildDebugHeader(new ProsperoFihHeaderMetadata
+            {
+                PfsSize = outer.PfsSize, SuperblockIndex = outer.SuperblockIndex,
+                SuperblockDigest = outer.GetBlockDigest(outer.SuperblockIndex),
+                InnerStoredBlockCount = outer.FileBlockCount[0], InnerLogicalBlockCount = layout.Ndblock,
+                InnerMetadataBaseBlock = layout.MetaBaseLogical / BlockSize, NapsLength = naps!.LongLength,
+                NapsDigest = ProsperoImageDigests.Sha3_256(naps),
+                InnerContentInodes = layout.Nodes.Count(n => n.ParentInode >= 0),
+                AppFileCount = layout.Nodes.Count(n => !n.IsDirectory && n.ParentInode >= 0 && n.Mode == NonSceSysFileMode),
+                ContentVersionHi = ContentVersionHigh(param.ContentVersion ?? "01.000.000"),
+            });
+            var container = BuildEmbeddedContainer(props, outer, fih, seed,
+                checked((uint)layout.Nodes.Count(n => !n.IsDirectory)), overrides, metadataSnapshotOnly: true);
+            token.ThrowIfCancellationRequested();
+            long cntOffset = checked(BlockSize + outer.PfsSize);
+            if (file.Position != cntOffset) throw new InvalidDataException("Unexpected streamed outer image length.");
+            file.Write(container.Bytes);
+            long mountSize = file.Position;
+            file.Position = 0;
+            file.Write(fih);
+            file.Flush();
+            file.Position = 0;
+            progress?.Invoke(new("Hashing finalized mount", mountSize));
+            var digests = ProsperoFinalizedMountDigests.Compute(file, mountSize,
+                checked((outer.SuperblockIndex + 1L) * BlockSize), cancellationToken: token);
+            token.ThrowIfCancellationRequested();
+            container.Xml.NestedInnerLayout = layout;
+            container.Xml.ChunkInfo = new ProsperoChunkInfoModel
+            {
+                PlayGoChunkDatSize = container.PlayGoChunkDat?.Length ?? 0,
+                TotalSize = cntOffset, Outer0Size = checked(outer.FileBlockCount[0] * (long)BlockSize),
+                Outer1Size = cntOffset - checked(outer.FileBlockCount[0] * (long)BlockSize),
+            };
+            progress?.Invoke(new("Writing SI", mountSize));
+            byte[] si = ProsperoSiArchive.BuildDebugSiSegmentFromDigests(container.Xml, container.PlayGoChunkDat, digests);
+            token.ThrowIfCancellationRequested();
+            if (file.Position != mountSize) throw new InvalidDataException("Mount hashing changed the output extent.");
+            file.Write(si);
+            long packageSize = file.Position;
+            file.Flush();
+            progress?.Invoke(new("Validating package", packageSize));
+            var report = ProsperoPkgValidator.Validate(ProsperoPkgReader.Read(file), contentId);
+            if (!report.Accepted)
+                throw new InvalidDataException("Generated package failed structural validation: " +
+                    string.Join("; ", report.Checks.Where(c => c.Status == ProsperoCheckStatus.Fail).Select(c => c.Detail)));
+            token.ThrowIfCancellationRequested();
+            return new ProsperoStreamingPackageResult
+            {
+                OutputPath = outputPath, ContentId = contentId, PackageSize = packageSize,
+                MountSize = mountSize, PfsSize = outer.PfsSize, InnerStoredSize = layout.OutputLength,
+                InnerLogicalSize = checked(layout.Ndblock * BlockSize), SourceFileCount = catalog.Files.Count,
+            };
+        }, confirmDeleteExistingPart, cancellationToken);
+    }
+
+    private static Dictionary<string, byte[]> SnapshotStreamingOverrides(IReadOnlyDictionary<string, byte[]>? source)
+    {
+        var result = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        long total = 0;
+        if (source is null) return result;
+        foreach (var (name, bytes) in source)
+        {
+            if (bytes is null) throw new ArgumentException("Null metadata replacement.", nameof(source));
+            total = checked(total + bytes.LongLength);
+            if (total > 64 * 1024 * 1024) throw new InvalidDataException("CNT replacements exceed the 64 MiB metadata limit.");
+            result.Add(name, bytes.ToArray());
+        }
+        return result;
+    }
+
+    // Freeze small CNT inputs before writing payloads. Construction must never fall back to disk:
+    // a changed/new media file could otherwise be a link to the growing output or an unbounded file.
+    private static void SnapshotStreamingMetadata(string folder, Dictionary<string, byte[]> snapshot,
+        CancellationToken token)
+    {
+        const long limit = 64 * 1024 * 1024;
+        long total = snapshot.Values.Sum(bytes => (long)bytes.Length);
+        void Walk(string directory, string prefix)
+        {
+            token.ThrowIfCancellationRequested();
+            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Symbolic metadata directories are not supported.");
+            foreach (string path in Directory.EnumerateFileSystemEntries(directory))
+            {
+                token.ThrowIfCancellationRequested();
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("Symbolic metadata paths are not supported.");
+                string relative = prefix + Path.GetFileName(path);
+                if ((attributes & FileAttributes.Directory) != 0) { Walk(path, relative + "/"); continue; }
+                bool param = relative == "param.json";
+                if (!param && !ProsperoCntEntryNames.NameToId.ContainsKey(relative)) continue;
+                // These descriptor entries are regenerated from actual image geometry.
+                if (relative is "imagedigs.dat" or "playgo-chunk.dat" or "playgo-hash-table.dat" or "playgo-ficm.dat") continue;
+                if (snapshot.ContainsKey(relative)) continue;
+                var before = new FileInfo(path);
+                long length = before.Length;
+                DateTime modified = before.LastWriteTimeUtc;
+                long available = param ? Math.Min(limit - total, 4 * 1024 * 1024) : limit - total;
+                if (length < 0 || length > available)
+                    throw new InvalidDataException("CNT source metadata exceeds its bounded snapshot budget: " + relative);
+                using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (source.Length != length) throw new IOException("Source metadata changed before inspection.");
+                byte[] bytes = new byte[checked((int)length)];
+                source.ReadExactly(bytes);
+                if (source.ReadByte() != -1) throw new IOException("Source metadata grew during inspection.");
+                var after = new FileInfo(path);
+                if (after.Length != length || after.LastWriteTimeUtc != modified ||
+                    (after.Attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("Source metadata changed during inspection.");
+                total += length;
+                snapshot.Add(relative, bytes);
+            }
+        }
+        Walk(Path.Combine(folder, "sce_sys"), "");
+    }
+
+    private static void RequireOutputOutsideSource(string source, string output)
+    {
+        static string Canonical(string path, int depth = 0)
+        {
+            if (depth > 64) throw new IOException("Too many symbolic path aliases.");
+            string full = Path.GetFullPath(path);
+            string root = Path.GetPathRoot(full)!;
+            string current = root;
+            foreach (string component in full[root.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+            {
+                current = Path.Combine(current, component);
+                if (!File.Exists(current) && !Directory.Exists(current)) continue;
+                var attributes = File.GetAttributes(current);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    FileSystemInfo info = (attributes & FileAttributes.Directory) != 0
+                        ? new DirectoryInfo(current) : new FileInfo(current);
+                    string target = info.ResolveLinkTarget(true)?.FullName
+                        ?? throw new IOException("Cannot resolve an output/source path alias.");
+                    current = Canonical(target, depth + 1);
+                }
+            }
+            return Path.TrimEndingDirectorySeparator(current);
+        }
+        string root = Canonical(source);
+        string destination = Canonical(output);
+        var comparison = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+            ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (destination.Equals(root, comparison) || destination.StartsWith(root + Path.DirectorySeparatorChar, comparison))
+            throw new ArgumentException("Package output must be outside the source folder.", nameof(output));
+    }
+
+    private sealed class StreamingImageOutput(Stream destination, CancellationToken token,
+        Action<ProsperoStreamingProgress>? progress) : Stream
+    {
+        private long written;
+        private long reported;
+        public override void Write(ReadOnlySpan<byte> bytes)
+        {
+            token.ThrowIfCancellationRequested();
+            destination.Write(bytes);
+            written = checked(written + bytes.Length);
+            if (written - reported >= 4 * 1024 * 1024)
+            {
+                reported = written;
+                progress?.Invoke(new("Writing PFS", checked(BlockSize + written)));
+            }
+        }
+        public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => destination.Flush();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+}

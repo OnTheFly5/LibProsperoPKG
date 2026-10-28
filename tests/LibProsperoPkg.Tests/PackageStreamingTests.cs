@@ -1,0 +1,235 @@
+using LibProsperoPkg.Content;
+using LibProsperoPkg.Metadata;
+using LibProsperoPkg.PFS;
+using LibProsperoPkg.PKG;
+using System.Buffers.Binary;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace LibProsperoPkg.Tests;
+
+internal static class PackageStreamingTests
+{
+    private const int B = 0x10000;
+    private const string Id = "UP9000-PPSA99099_00-PROSPERO00000000";
+    internal static void Run()
+    {
+        FolderToPackage();
+        FailedJobsLeaveNoOutput();
+        FrozenMetadataAndBudgets();
+    }
+
+    private static byte[] Module()
+    {
+        var elf = new byte[0x180];
+        new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 2, 1, 1 }.CopyTo(elf, 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(elf.AsSpan(0x10), 2);
+        BinaryPrimitives.WriteUInt16LittleEndian(elf.AsSpan(0x12), 62);
+        BinaryPrimitives.WriteUInt32LittleEndian(elf.AsSpan(0x14), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x20), 0x40);
+        BinaryPrimitives.WriteUInt16LittleEndian(elf.AsSpan(0x34), 0x40);
+        BinaryPrimitives.WriteUInt16LittleEndian(elf.AsSpan(0x36), 0x38);
+        BinaryPrimitives.WriteUInt16LittleEndian(elf.AsSpan(0x38), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(elf.AsSpan(0x40), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(elf.AsSpan(0x44), 5);
+        BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x48), 0x100);
+        BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x50), 0x400000);
+        BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x60), 0x80);
+        BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x68), 0x80);
+        BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x70), 0x1000);
+        elf.AsSpan(0x100).Fill(0x90);
+        return ProsperoFself.MakeFself(elf);
+    }
+
+    private static string Setup(string directory)
+    {
+        string source = Path.Combine(directory, "source");
+        Directory.CreateDirectory(Path.Combine(source, "sce_sys"));
+        File.WriteAllText(Path.Combine(source, "sce_sys", "param.json"),
+            ProsperoParam.CreateDefault(Id, "PPSA99099", "Streaming fixture").ToJson());
+        File.WriteAllBytes(Path.Combine(source, "eboot.bin"), Module());
+        byte[] data = new byte[0x80000 + 123];
+        new Random(71).NextBytes(data);
+        data.AsSpan(0, 0x40000).Fill(0x55);
+        Directory.CreateDirectory(Path.Combine(source, "assets"));
+        File.WriteAllBytes(Path.Combine(source, "assets", "data.bin"), data);
+        File.WriteAllBytes(Path.Combine(source, "empty"), Array.Empty<byte>());
+        return source;
+    }
+
+    private static Dictionary<string, string> Snapshot(string folder) => Directory
+        .EnumerateFiles(folder, "*", SearchOption.AllDirectories).ToDictionary(p => Path.GetRelativePath(folder, p),
+            p => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(p))) + ":" + File.GetLastWriteTimeUtc(p).Ticks);
+
+    private static void Same(ReadOnlySpan<byte> expected, ReadOnlySpan<byte> actual, string context)
+        => Program.Equal(true, expected.SequenceEqual(actual), context);
+
+    private static void FolderToPackage()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-pipeline-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            var original = Snapshot(source);
+            foreach (bool kraken in new[] { true, false })
+            {
+                string target = Path.Combine(root, kraken ? "compressed.pkg" : "stored.pkg");
+                var stages = new List<string>();
+                var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions
+                {
+                    SourceFolder = source, OutputPath = target, UseKraken = kraken,
+                    ImageSeed = new byte[16], Timestamp = DateTimeOffset.FromUnixTimeSeconds(12345678),
+                }, progress: p => stages.Add(p.Stage));
+                Program.Equal(target, result.OutputPath, "published target path");
+                Program.Equal(result.PackageSize, new FileInfo(target).Length, "final size includes SI");
+                Program.Equal(false, File.Exists(target + ".part"), "part removed only after publication");
+                Program.Equal(true, stages.Contains("Hashing finalized mount") && stages.Contains("Writing SI"), "complete finalization stages");
+                foreach (var (path, state) in original) Program.Equal(state, Snapshot(source)[path], "source bytes and timestamps preserved");
+                Program.Equal(original.Count, Snapshot(source).Count, "no generated files in source");
+                VerifyPackage(target, source, result, kraken);
+            }
+            Program.Equal(2, Directory.GetFiles(root).Length, "only selected output packages are created");
+            Program.Equal(1, Directory.GetDirectories(root).Length, "no staging directory");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static void VerifyPackage(string target, string source, ProsperoStreamingPackageResult result, bool kraken)
+    {
+        var parsed = ProsperoPkgReader.Read(target);
+        Program.Equal(ProsperoPkgType.FullDebug, parsed.Type, "full FIH package parsed");
+        Program.Equal(Id, parsed.Header!.ContentId, "source content id used");
+        Program.Equal(true, ProsperoPkgValidator.Validate(parsed, Id).Accepted, "structural acceptance gate");
+        byte[] package = File.ReadAllBytes(target); // small test fixture only; production never materializes it
+        int sbIndex = checked((int)(BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20)) / B - 1));
+        int innerBlocks = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(package.AsSpan(0x90)));
+        byte[] outer = package.AsSpan(B, (int)result.PfsSize).ToArray();
+        var kinds = Enumerable.Range(0, outer.Length / B).Select(i => i == sbIndex ? ProsperoOuterBlockKind.Plaintext
+            : i < innerBlocks ? ProsperoOuterBlockKind.Data : ProsperoOuterBlockKind.Signed).ToArray();
+        var (tweak, dataKey) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ProsperoPfsKeys.DeriveEkpfs(Id, new('0', 32)), new byte[16]);
+        ProsperoOuterPfsImage.Transform(outer, tweak, dataKey, B, kinds, encrypt: false);
+        using var inodeReader = new MemoryStream(outer);
+        inodeReader.Position = (sbIndex + 1L) * B + 3 * ProsperoDinodeS32.SizeOf;
+        var innerInode = ProsperoDinodeS32.ReadFromStream(inodeReader);
+        var napsInode = ProsperoDinodeS32.ReadFromStream(inodeReader);
+        byte[] inner = outer.AsSpan(innerInode.db[0].block * B, (int)innerInode.Size).ToArray();
+        byte[] naps = outer.AsSpan(napsInode.db[0].block * B, (int)napsInode.Size).ToArray();
+        Same(ProsperoImageDigests.Sha3_256(naps), package.AsSpan(0xb0, 32), "FIH records NAPS hash");
+        var mount = ProsperoPs5InnerImageReader.ReconstructMount(inner, naps, result.InnerLogicalSize);
+        var recoveredFiles = ProsperoPs5InnerImageReader.ReadFileTree(mount.Mount, mount.SuperblockOffset);
+        foreach (var file in recoveredFiles)
+        {
+            string originalPath = Path.Combine(source, file.Path.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+            if (File.Exists(originalPath)) Same(File.ReadAllBytes(originalPath), mount.Mount.AsSpan((int)file.LogicalOffset, (int)file.Size), "recovered complete source payload");
+        }
+        Program.Equal(true, recoveredFiles.Any(f => f.Path.EndsWith("assets/data.bin")), "asset recovered from NAPS");
+        var catalog = ProsperoStreamingFolderSource.Create(source, new('0', 32));
+        var assembler = new ProsperoPs5InnerImageAssembler(12345678, 0, kraken);
+        var buffered = assembler.Build(catalog.Files.Select(f =>
+        {
+            using var reader = f.OpenRead();
+            using var output = new MemoryStream(); reader.CopyTo(output);
+            return new ProsperoPs5InnerFile { Path = f.Path, Data = output.ToArray() };
+        }).ToArray());
+        Same(buffered.Image, inner, "pipeline equals buffered inner builder");
+        if (!kraken)
+        {
+            Program.Equal(true, buffered.Placements.All(p => p.StoreRaw), "Kraken off stores every file");
+            Program.Equal(true, buffered.MetadataBlocks.All(b => b.CompressedSize == b.UncompressedSize), "Kraken off stores metadata too");
+        }
+        // Every serialized descriptor digest authenticates the corresponding final plaintext outer block.
+        var imageDigests = parsed.Entries.Single(e => e.RawId == 0x40a);
+        long cnt = (long)parsed.Fih!.EmbeddedCntOffset;
+        for (int i = 0; i < kinds.Length; i++)
+        {
+            byte[] expected = package.AsSpan((int)(cnt + (long)imageDigests.DataOffset + i * 32), 32).ToArray();
+            Array.Reverse(expected);
+            Same(expected, ProsperoImageDigests.Sha3_256(outer.AsSpan(i * B, B)), "complete output block digests");
+        }
+        using var zipSource = new MemoryStream(package, (int)result.MountSize, package.Length - (int)result.MountSize, writable: false);
+        using var zip = new ZipArchive(zipSource, ZipArchiveMode.Read);
+        Program.Equal(8, zip.Entries.Count, "complete SI member set");
+        using var crcReader = zip.Entries.Single(e => e.FullName.EndsWith("playgo-chunk.crc")).Open();
+        using var crc = new MemoryStream(); crcReader.CopyTo(crc);
+        Same(LibProsperoPkg.PlayGo.ProsperoPlayGo.BuildChunkCrc(package.AsSpan(0, (int)result.MountSize)), crc.ToArray(), "SI CRCs cover final mount");
+    }
+
+    private static void FailedJobsLeaveNoOutput()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-pipeline-fail-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            string target = Path.Combine(root, "game.pkg");
+            ProsperoStreamingPackageOptions Options(string output) => new() { SourceFolder = source, OutputPath = output };
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(Path.Combine(source, "out.pkg"))));
+            Program.Equal(false, File.Exists(Path.Combine(source, "out.pkg.part")), "source-contained output rejected before create");
+            using var cancelled = new CancellationTokenSource();
+            Program.Throws<OperationCanceledException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(target),
+                progress: p => { if (p.Stage == "Finalizing CNT and FIH") cancelled.Cancel(); }, cancellationToken: cancelled.Token));
+            Program.Equal(false, File.Exists(target) || File.Exists(target + ".part"), "cancel removes owned partial");
+            Program.Throws<InvalidOperationException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(target),
+                progress: p => { if (p.Stage == "Writing SI") throw new InvalidOperationException("injected late failure"); }));
+            Program.Equal(false, File.Exists(target) || File.Exists(target + ".part"), "late failure removes owned partial");
+            byte[] original = File.ReadAllBytes(Path.Combine(source, "eboot.bin"));
+            File.WriteAllBytes(Path.Combine(source, "eboot.bin"), new byte[] { 0x7f, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 62, 0 });
+            Program.Throws<NotSupportedException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(target)));
+            Program.Equal(false, File.Exists(target) || File.Exists(target + ".part"), "raw module failure leaves no package");
+            File.WriteAllBytes(Path.Combine(source, "eboot.bin"), original);
+            string alias = Path.Combine(root, "source-alias");
+            if (!OperatingSystem.IsWindows())
+            {
+                Directory.CreateSymbolicLink(alias, source);
+                Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(Path.Combine(alias, "out.pkg"))));
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+    private static void FrozenMetadataAndBudgets()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-snapshot-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            string target = Path.Combine(root, "frozen.pkg");
+            string icon = Path.Combine(source, "sce_sys", "icon0.png");
+            byte[] captured = new byte[] { 7, 8, 9 };
+            File.WriteAllBytes(icon, captured);
+            bool changed = false;
+            var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions
+            {
+                SourceFolder = source, OutputPath = target,
+            }, progress: p =>
+            {
+                if (p.Stage != "Finalizing CNT and FIH" || changed) return;
+                changed = true;
+                File.Delete(icon);
+                if (!OperatingSystem.IsWindows()) File.CreateSymbolicLink(icon, target + ".part");
+                else File.WriteAllBytes(icon, new byte[] { 1, 2, 3 });
+                using var unexpected = new FileStream(Path.Combine(source, "sce_sys", "icon0.dds"), FileMode.CreateNew);
+                unexpected.SetLength(64L * 1024 * 1024 + 1); // Must never be opened by CNT finalization.
+            });
+            Program.Equal(true, changed, "test mutates source metadata only after snapshot");
+            var parsed = ProsperoPkgReader.Read(target);
+            byte[] pkg = File.ReadAllBytes(target);
+            var entry = parsed.Entries.Single(e => e.RawId == 0x1200);
+            Same(captured, pkg.AsSpan((int)((long)parsed.Fih!.EmbeddedCntOffset + (long)entry.DataOffset), (int)entry.DataSize),
+                "CNT uses frozen metadata instead of a changed file/output symlink");
+            Program.Equal(false, parsed.Entries.Any(e => e.RawId == 0x1280), "new source metadata is not read after snapshot");
+            File.Delete(icon);
+            string tooLarge = Path.Combine(source, "sce_sys", "icon0.dds");
+            string rejected = Path.Combine(root, "oversized.pkg");
+            Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions
+            {
+                SourceFolder = source, OutputPath = rejected,
+            }));
+            Program.Equal(false, File.Exists(rejected) || File.Exists(rejected + ".part"), "oversized metadata rejected before output creation");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+}

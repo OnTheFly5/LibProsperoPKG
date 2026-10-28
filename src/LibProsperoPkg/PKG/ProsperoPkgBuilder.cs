@@ -107,7 +107,7 @@ public sealed class ProsperoPkgBuildProperties
 /// Prepared folder to complete PS5 CNT package builder. See the file header for the
 /// architecture and validation boundary.
 /// </summary>
-public static class ProsperoPkgBuilder
+public static partial class ProsperoPkgBuilder
 {
     // PS5 header constants.
     // CNT header @0x70. Content whose info resolves without an entitlement lookup.
@@ -501,7 +501,8 @@ public static class ProsperoPkgBuilder
 
     private static ProsperoCnt BuildContainer(
         ProsperoPkgBuildProperties props, byte[] ekpfs, string sourceFolder,
-        ulong pfsSize, int imagedigsSize, uint playgoFileCount, ulong mchunk0Size, ulong mchunk1Size)
+        ulong pfsSize, int imagedigsSize, uint playgoFileCount, ulong mchunk0Size, ulong mchunk1Size,
+        IReadOnlyDictionary<string, byte[]>? metadataOverrides = null, bool metadataSnapshotOnly = false)
     {
         uint contentType = ContentTypeFor(props.VolumeType);
         var pkg = new ProsperoCnt
@@ -571,7 +572,9 @@ public static class ProsperoPkgBuilder
         pkg.EntryNames = new ProsperoCntNameTableEntry();
 
         // param.json (PS5 entry id 0x2000).
-        byte[] paramJson = ReadParamJson(sourceFolder);
+        byte[] paramJson = metadataOverrides is not null && metadataOverrides.TryGetValue("param.json", out var overrideParam)
+            ? NormalizeParamJson(overrideParam) : metadataSnapshotOnly
+                ? throw new InvalidDataException("The CNT metadata snapshot requires param.json.") : ReadParamJson(sourceFolder);
         var paramEntry = new ProsperoCntGenericEntry((ProsperoCntEntryId)0x2000, "param.json") { FileData = paramJson };
 
         pkg.Entries = new List<ProsperoCntEntry>
@@ -617,7 +620,7 @@ public static class ProsperoPkgBuilder
         // sce_sys media entries (icon0.png, pic0.png, pic1.png, snd0.at9, ...) present in the folder.
         // Skip any id already staged by the descriptor pass: playgo-chunk.dat (0x1001) is generated
         // from the rebuilt image's chunk sizes above, so a source copy of it is not added a second time.
-        foreach (var media in CollectMediaEntries(sourceFolder))
+        foreach (var media in CollectMediaEntries(sourceFolder, metadataOverrides, metadataSnapshotOnly))
             if (!pkg.Entries.Any(e => (uint)e.Id == (uint)media.Id))
                 pkg.Entries.Add(media);
 
@@ -864,7 +867,13 @@ public static class ProsperoPkgBuilder
         if (sbOffsetInImage >= 0 && sbOffsetInImage + PfsSeedOffset + seed.Length <= image.Length)
             Array.Copy(image, sbOffsetInImage + PfsSeedOffset, seed, 0, seed.Length);
 
-        ParamJsonInfo pj = ReadParamJsonInfo(sourceFolder);
+        return BuildSiXmlOptionsFromSeed(pkg, seed, sourceFolder);
+    }
+
+    private static ProsperoPfsImageXmlOptions BuildSiXmlOptionsFromSeed(ProsperoCnt pkg, byte[] seed,
+        string sourceFolder, byte[]? paramJsonOverride = null)
+    {
+        ParamJsonInfo pj = ReadParamJsonInfo(sourceFolder, paramJsonOverride);
 
         long pfsImageSize = (long)pkg.Header.pfs_image_size;
         long containerSize = (long)pkg.Header.pfs_image_offset;   // CNT-internal value = CNT body end = CNT size.
@@ -1001,14 +1010,14 @@ public static class ProsperoPkgBuilder
 
     // Best-effort param.json reader for the pfsimage.xml string fields. Any parse failure falls back to
     // the neutral defaults (the produced XML stays structurally valid and self-consistent).
-    private static ParamJsonInfo ReadParamJsonInfo(string sourceFolder)
+    private static ParamJsonInfo ReadParamJsonInfo(string sourceFolder, byte[]? paramJsonOverride = null)
     {
         string contentVersion = "01.000.000", masterVersion = "01.00",
                sdkVersion = "0x0000000000000000", reqSys = "0x0000000000000000",
                appDrm = "free", title = "";
         try
         {
-            byte[] pj = ReadParamJson(sourceFolder);
+            byte[] pj = paramJsonOverride is null ? ReadParamJson(sourceFolder) : NormalizeParamJson(paramJsonOverride);
             if (pj is { Length: > 0 })
             {
                 using var doc = JsonDocument.Parse(pj);
@@ -1235,17 +1244,21 @@ public static class ProsperoPkgBuilder
     // file. Id 0x1000 is not part of a PS5 package and is skipped if a source file maps to it.
     private static readonly HashSet<uint> GeneratedEntryIds = [0x1000];
 
-    private static IEnumerable<ProsperoCntEntry> CollectMediaEntries(string sourceFolder)
+    private static IEnumerable<ProsperoCntEntry> CollectMediaEntries(string sourceFolder,
+        IReadOnlyDictionary<string, byte[]>? metadataOverrides = null, bool metadataSnapshotOnly = false)
     {
         var sceSys = Path.Combine(sourceFolder, "sce_sys");
         var emitted = new HashSet<uint>();
+        bool Exists(string relative) => metadataOverrides?.ContainsKey(relative) == true || (!metadataSnapshotOnly && File.Exists(Path.Combine(sceSys, relative)));
+        byte[] Read(string relative) => metadataOverrides is not null && metadataOverrides.TryGetValue(relative, out var bytes)
+            ? bytes : metadataSnapshotOnly ? throw new InvalidDataException("Missing snapshot metadata: " + relative)
+                : File.ReadAllBytes(Path.Combine(sceSys, relative));
 
         foreach (var (name, id) in MediaFiles)
         {
-            var path = Path.Combine(sceSys, name);
-            if (!File.Exists(path)) continue;
+            if (!Exists(name)) continue;
             emitted.Add(id);
-            var data = File.ReadAllBytes(path);
+            var data = Read(name);
             yield return new ProsperoCntGenericEntry((ProsperoCntEntryId)id, name) { FileData = data };
         }
 
@@ -1253,19 +1266,17 @@ public static class ProsperoPkgBuilder
         // one (e.g. extracted from a package); otherwise generate it from the *.png.
         foreach (var (png, dds, id) in DdsMedia)
         {
-            var ddsPath = Path.Combine(sceSys, dds);
             byte[]? data = null;
-            if (File.Exists(ddsPath))
+            if (Exists(dds))
             {
-                data = File.ReadAllBytes(ddsPath);
+                data = Read(dds);
             }
             else
             {
-                var pngPath = Path.Combine(sceSys, png);
-                if (!File.Exists(pngPath)) continue;
+                if (!Exists(png)) continue;
                 try
                 {
-                    data = ProsperoDdsEncoder.EncodePngToDds(File.ReadAllBytes(pngPath));
+                    data = ProsperoDdsEncoder.EncodePngToDds(Read(png));
                 }
                 catch
                 {
@@ -1283,17 +1294,19 @@ public static class ProsperoPkgBuilder
         // must be carried in the outer container instead. Covers the backend-authored license,
         // network-platform, self-info, delta-info, keymap_rp, changeinfo, pronunciation and trophy
         // files. These blobs are packed as supplied; the library never fabricates them.
-        if (!Directory.Exists(sceSys)) yield break;
-        foreach (var file in Directory.EnumerateFiles(sceSys, "*", SearchOption.AllDirectories)
-                                      .OrderBy(p => p, StringComparer.Ordinal))
+        var supplied = !metadataSnapshotOnly && Directory.Exists(sceSys)
+            ? Directory.EnumerateFiles(sceSys, "*", SearchOption.AllDirectories)
+                .Select(file => Path.GetRelativePath(sceSys, file).Replace('\\', '/'))
+            : Enumerable.Empty<string>();
+        if (metadataOverrides is not null) supplied = supplied.Concat(metadataOverrides.Keys);
+        foreach (var rel in supplied.Distinct(StringComparer.Ordinal).OrderBy(p => p, StringComparer.Ordinal))
         {
-            var rel = Path.GetRelativePath(sceSys, file).Replace('\\', '/');
             if (!ProsperoCntEntryNames.NameToId.TryGetValue(rel, out var id)) continue;
             var idv = (uint)id;
             if (rel.EndsWith(".dds", StringComparison.Ordinal)) continue; // handled by the DDS pass
             if (GeneratedEntryIds.Contains(idv)) continue;
             if (!emitted.Add(idv)) continue; // already emitted above
-            var data = File.ReadAllBytes(file);
+            var data = Read(rel);
             if (!ProsperoSystemFiles.Validate(rel, data, out var error))
                 throw new InvalidDataException($"sce_sys/{rel}: {error}");
             yield return new ProsperoCntGenericEntry(id, rel) { FileData = data };

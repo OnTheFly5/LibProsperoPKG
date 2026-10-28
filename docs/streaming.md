@@ -1,7 +1,49 @@
 # Experimental streaming primitives
 
-These APIs support the OnTheFly5 streaming feasibility work. They are not yet
-an end-to-end FPKG builder and do not replace `ProsperoPackageBuilder.Build`.
+These APIs support the OnTheFly5 streaming feasibility work. They include an experimental prepared-folder-to-local FPKG path; they do not
+replace the legacy `ProsperoPackageBuilder.Build` or integrate the desktop UI.
+
+## Complete local prepared-folder path
+
+`ProsperoPkgBuilder.BuildLocalStreaming` produces a complete experimental local
+FIH/PFS/CNT/SI package from a prepared folder. It creates only the selected
+`.part`, writes nested images through forward-only buffers, finalizes CNT/FIH,
+reads that same patched mount once for SHA3/CRC, appends SI, validates the parsed
+package and publishes without overwrite. No extracted tree or intermediate
+image/package copy is written. `ProsperoStreamingPackageOptions.UseKraken`
+defaults to true; false stores payloads and filesystem metadata. This is separate
+from the legacy `ProsperoPackageBuilder.Build` entry point.
+
+```csharp
+var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions
+{
+    SourceFolder = source,
+    OutputPath = target,
+}, confirmDeleteExistingPart: path => userConfirmedDeletion);
+```
+
+Final output must be outside the source, in an existing directory. Existing
+finals fail, including publication races. Existing partials require explicit
+deletion consent; failure/cancellation removes this invocation's partial and
+reports cleanup failures. Identity guards preserve detected path replacement;
+portable conditional unlink/rename cannot protect against an uncooperative
+writer changing the output directory continuously.
+
+The folder catalog filters CNT/project files and injects missing keystone/about
+metadata in RAM. Small UCP repair is capped at 16 MiB/file and 64 MiB overlays.
+CNT inputs are frozen before payload generation (64 MiB total, 4 MiB param.json),
+with no late filesystem fallback. Source files/timestamps remain unchanged.
+Raw ELF conversion is not supplied: executables must already be prepared SELF.
+The profile requires ASCII names, rejects links/collisions, and omits empty
+directories like the existing file-only assembler. Application inputs require
+eboot.bin; output within the source, including resolved directory aliases, fails.
+
+The existing SI format still limits aligned physical inner size to its 32-bit
+phdr field and file extents to 32-bit sizes. This path does not establish large
+game or target-console compatibility. FTP/RAR and the production callback/UI
+integration remain future work. Complete managed/NativeAOT regressions recover
+all fixture payloads, validate CNT seals/digests and SI CRCs, preserve source
+snapshots, exercise Kraken on/off and inject failures/cancellation/races.
 
 ## Data-first inner image
 
@@ -146,8 +188,8 @@ that actual convention and rejects inconsistent geometry, missing digests,
 out-of-range extents and unsupported 32-bit phdr/file-size fields. It preserves
 the legacy coarse per-file SI projection; large-game SI mapping/widths still
 need format work. A 400 GiB header-only fixture proves scalar serialization,
-not complete-package support at that size. The production package entry point
-still requires streamed CNT construction, source overlays and output lifecycle.
+not complete-package support at that size. The new local entry point connects CNT construction, overlays and output lifecycle;
+the legacy entry point and production desktop bindings remain separate.
 
 ## Ownership, resources, and limitations
 
@@ -168,9 +210,9 @@ still requires streamed CNT construction, source overlays and output lifecycle.
 - The current name codec is ASCII. Streaming source descriptors reject
   unsupported Unicode names and unrepresentable 40-bit sizes/offsets before
   opening payload readers rather than silently renaming/truncating them.
-- Higher-level outer filesystem addressing, SI integration/large-game geometry, source overlays,
-  full-package hashing, no-Kraken package mode, and NativeAOT callback bindings remain to be
-  integrated. No console or 100–400 GB package claim follows from these fixtures.
+- Higher-level outer addressing, large-game SI geometry, raw module conversion,
+  FTP/RAR and production NativeAOT callback bindings remain open. No console or
+  100–400 GB package claim follows from these fixtures.
 
 ## NAPS and metadata inspection
 
@@ -228,6 +270,6 @@ a synthetic 115 MiB image to a sampling sink. Console compatibility remains unve
 The dedicated `tests/LibProsperoPkg.StreamingNativeTests` project links the same
 streaming regressions for NativeAOT, excluding the managed-only legacy XML
 comparison. See its README for publish/run commands. The managed suite passed
-13,866 assertions and the native streaming runner passed 13,575 on macOS arm64.
+14,093 assertions and the native streaming runner passed 13,799 on macOS arm64.
 The existing C ABI compatibility proof and independent 5,201 native SHA3 checks
 also passed. Linux and remote workflow results must be checked independently.

@@ -20,8 +20,13 @@ jobs:
         include:
           - runner: ubuntu-24.04
             rid: linux-x64
+            executable_suffix: ""
           - runner: macos-14
             rid: osx-arm64
+            executable_suffix: ""
+          - runner: windows-2022
+            rid: win-x64
+            executable_suffix: ".exe"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -44,4 +49,4 @@ jobs:
           -c Release -r ${{ matrix.rid }} --artifacts-path .TestArtifacts/Native
           -p:UseSharedCompilation=false -o .TestArtifacts/Executable
       - name: Native streaming regressions
-        run: .TestArtifacts/Executable/LibProsperoPkg.StreamingNativeTests
+        run: ./.TestArtifacts/Executable/LibProsperoPkg.StreamingNativeTests${{ matrix.executable_suffix }}

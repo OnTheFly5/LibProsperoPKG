@@ -123,13 +123,19 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     private readonly long _timeSec;
     private readonly uint _timeNsec;
+    private readonly bool _useKraken;
 
     /// <param name="buildTimeSec">Build timestamp seconds (package c_date/c_time — a deterministic build input).</param>
     /// <param name="buildTimeNsec">Build timestamp nanoseconds fraction.</param>
     public ProsperoPs5InnerImageAssembler(long buildTimeSec, uint buildTimeNsec)
+        : this(buildTimeSec, buildTimeNsec, useKraken: true) { }
+
+    /// <summary>Selects Kraken for both file payloads and filesystem metadata.</summary>
+    public ProsperoPs5InnerImageAssembler(long buildTimeSec, uint buildTimeNsec, bool useKraken)
     {
         _timeSec = buildTimeSec;
         _timeNsec = buildTimeNsec;
+        _useKraken = useKraken;
     }
 
     // ---- Internal tree model -----------------------------------------------------------------------
@@ -242,7 +248,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             // An unsigned executable image is meant to become a signed module before it reaches the
             // image; the caller owns that conversion. Reaching here with one is not an error, so it is
             // stored as it stands rather than failing a build that would otherwise succeed.
-            f.StoreRaw = f.Length == 0 || policy is ProsperoInnerFilePolicy.StoreVerbatim
+            f.StoreRaw = !_useKraken || f.Length == 0 || policy is ProsperoInnerFilePolicy.StoreVerbatim
                 or ProsperoInnerFilePolicy.RequiresModuleConversion;
             using var input = new MemoryStream(f.Data, writable: false);
             using var encoded = new MemoryStream();
@@ -378,7 +384,7 @@ public sealed class ProsperoPs5InnerImageAssembler
             f.Data = new byte[(int)Math.Min(f.Length, ProsperoInnerFileClassifier.HeaderLength)];
             source.ReadExactly(f.Data);
             var policy = f.Policy ?? ProsperoInnerFileClassifier.Classify(f.Data);
-            f.StoreRaw = f.Length == 0 || policy is ProsperoInnerFilePolicy.StoreVerbatim or ProsperoInnerFilePolicy.RequiresModuleConversion;
+            f.StoreRaw = !_useKraken || f.Length == 0 || policy is ProsperoInnerFilePolicy.StoreVerbatim or ProsperoInnerFilePolicy.RequiresModuleConversion;
             f.SceSys = f.FullPath.StartsWith("/sce_sys/", StringComparison.Ordinal);
             f.WholeBlockRaw = IsKeystone(f.FullPath);
             bool alignBefore = f.WholeBlockRaw ||
@@ -415,13 +421,11 @@ public sealed class ProsperoPs5InnerImageAssembler
         PadToBlock(destination, ref physical, cancellationToken);
         long metadataOffset = physical;
         byte[] compressedMetadata = ProsperoPs5InnerImageBuilder.CompressPayload(metadata,
-            storeRaw: false, out var metadataFile);
+            storeRaw: !_useKraken, out var metadataFile);
         cancellationToken.ThrowIfCancellationRequested();
         destination.Write(compressedMetadata);
         physical = checked(physical + compressedMetadata.LongLength);
-        var metadataBlocks = metadataFile is null ? Array.Empty<ProsperoInnerMetaBlockChunk>()
-            : metadataFile.Blocks.Select(b => new ProsperoInnerMetaBlockChunk(b.CompressedSize,
-                b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToArray();
+        var metadataBlocks = MetadataChunks(metadata, metadataFile);
         return new ProsperoPs5InnerImageLayout
         {
             OutputLength = physical, MetadataPlaintext = metadata, Nodes = nodes, Ndblock = ndblock,
@@ -435,6 +439,19 @@ public sealed class ProsperoPs5InnerImageAssembler
             CompressedMetadata = compressedMetadata, MetadataBlocks = metadataBlocks,
             DataEndLogical = logical, MetaBaseLogical = metaBase,
         };
+    }
+
+    private IReadOnlyList<ProsperoInnerMetaBlockChunk> MetadataChunks(byte[] plaintext,
+        Compression.ProsperoCompressedPfsFile? encoded)
+    {
+        if (encoded is not null)
+            return encoded.Blocks.Select(b => new ProsperoInnerMetaBlockChunk(b.CompressedSize,
+                b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToArray();
+        if (_useKraken) return Array.Empty<ProsperoInnerMetaBlockChunk>();
+        const int size = 0x40000;
+        return Enumerable.Range(0, (plaintext.Length + size - 1) / size)
+            .Select(i => Math.Min(size, plaintext.Length - i * size))
+            .Select(n => new ProsperoInnerMetaBlockChunk(n, n, false, n)).ToArray();
     }
 
     private static void PadToBlock(Stream destination, ref long position, CancellationToken cancellationToken)
@@ -951,12 +968,9 @@ public sealed class ProsperoPs5InnerImageAssembler
         pos += blockInfo.Length;
         payloads.Add(new ProsperoPs5InnerPayload { Data = blockInfo, StoreRaw = true, BlockAligned = true });
 
-        compressedMeta = ProsperoPs5InnerImageBuilder.CompressPayload(metaPlain, storeRaw: false, out var metaPf);
+        compressedMeta = ProsperoPs5InnerImageBuilder.CompressPayload(metaPlain, storeRaw: !_useKraken, out var metaPf);
         // Capture the per-256KiB-block chunk table so the naps generator reuses it (no second Kraken pass).
-        metaBlocks = metaPf is null
-            ? Array.Empty<ProsperoInnerMetaBlockChunk>()
-            : metaPf.Blocks.Select(b => new ProsperoInnerMetaBlockChunk(
-                b.CompressedSize, b.UncompressedSize, b.IsMultiChunk, b.FirstChunkCompressedSize)).ToList();
+        metaBlocks = MetadataChunks(metaPlain, metaPf);
         pos = AlignUp(pos, BLK);
         metadataOnDisk = pos;
         payloads.Add(new ProsperoPs5InnerPayload

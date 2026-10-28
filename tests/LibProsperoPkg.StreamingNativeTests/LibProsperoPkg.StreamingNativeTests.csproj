@@ -14,5 +14,9 @@
     <Compile Include="../LibProsperoPkg.Tests/NapsStreamingTests.cs" Link="NapsStreamingTests.cs" />
     <Compile Include="../LibProsperoPkg.Tests/OuterStreamingTests.cs" Link="OuterStreamingTests.cs" />
     <Compile Include="../LibProsperoPkg.Tests/FinalizationTests.cs" Link="FinalizationTests.cs" />
+    <Compile Include="../LibProsperoPkg.Tests/CntStreamingTests.cs" Link="CntStreamingTests.cs" />
+    <Compile Include="../LibProsperoPkg.Tests/FolderSourceTests.cs" Link="FolderSourceTests.cs" />
+    <Compile Include="../LibProsperoPkg.Tests/LocalOutputTests.cs" Link="LocalOutputTests.cs" />
+    <Compile Include="../LibProsperoPkg.Tests/PackageStreamingTests.cs" Link="PackageStreamingTests.cs" />
   </ItemGroup>
 </Project>
