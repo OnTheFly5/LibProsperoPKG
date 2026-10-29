@@ -330,7 +330,8 @@ public sealed class ProsperoPs5InnerImageAssembler
     /// This is an inner-image API, not a complete FPKG builder; the caller owns the output stream.
     /// </summary>
     public ProsperoPs5InnerImageLayout Write(Stream destination,
-        IReadOnlyList<ProsperoPs5InnerFileSource> files, CancellationToken cancellationToken = default)
+        IReadOnlyList<ProsperoPs5InnerFileSource> files, CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? directories = null)
     {
         ArgumentNullException.ThrowIfNull(destination);
         ArgumentNullException.ThrowIfNull(files);
@@ -355,12 +356,42 @@ public sealed class ProsperoPs5InnerImageAssembler
                 throw new ArgumentException("Invalid or duplicate inner file path: " + file.Path, nameof(files));
             headers.Add(new ProsperoPs5InnerFile { Path = path, Data = Array.Empty<byte>(), Policy = file.Policy });
         }
-        foreach (string path in sources.Keys)
-            for (int slash = path.LastIndexOf('/'); slash > 0; slash = path.LastIndexOf('/', slash - 1))
-                if (sources.ContainsKey(path[..slash]))
-                    throw new ArgumentException("A file is also used as a directory: " + path, nameof(files));
+        // Validate explicitly supplied directories and inferred parents in the same case-insensitive
+        // namespace as files. Never turn a file into a directory or lose a case collision.
+        var paths = new Dictionary<string, (string Path, bool Directory)>(StringComparer.OrdinalIgnoreCase);
+        void AddPath(string raw, bool directory)
+        {
+            string path = raw.TrimStart('/');
+            if (path.Any(c => c > 0x7f))
+                throw new NotSupportedException("Non-ASCII PFS names are not supported by the current dirent codec: " + raw);
+            if (path.Length == 0 || path.Split('/').Any(p => p.Length == 0 || p.Length > 255 || p is "." or "..") ||
+                path.Any(c => char.IsControl(c) || c == '\\'))
+                throw new ArgumentException("Invalid inner image path: " + raw);
+            var parts = path.Split('/');
+            string current = "";
+            for (int i = 0; i < parts.Length; i++)
+            {
+                current += "/" + parts[i];
+                bool isDir = directory || i < parts.Length - 1;
+                if (paths.TryGetValue(current, out var prior))
+                {
+                    if (!string.Equals(prior.Path, current, StringComparison.Ordinal) || !prior.Directory || !isDir)
+                        throw new ArgumentException("Conflicting inner image paths: " + raw);
+                }
+                else paths.Add(current, (current, isDir));
+            }
+        }
+        foreach (string path in sources.Keys) AddPath(path, false);
+        var explicitDirs = directories ?? Array.Empty<string>();
+        var seenDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string path in explicitDirs)
+        {
+            ArgumentNullException.ThrowIfNull(path);
+            if (!seenDirs.Add(path.TrimStart('/'))) throw new ArgumentException("Duplicate inner directory: " + path, nameof(directories));
+            AddPath(path, true);
+        }
         cancellationToken.ThrowIfCancellationRequested();
-        Dir uroot = BuildTree(headers);
+        Dir uroot = BuildTree(headers, explicitDirs);
         var (dirsPreOrder, fileNodes, afidOrder, superRootInode,
             inodeFltInode, aprFltInode, afidTableInode) = PrepareTree(uroot);
         BuildDirents(uroot);
@@ -547,7 +578,7 @@ public sealed class ProsperoPs5InnerImageAssembler
 
     // ---- Tree construction -------------------------------------------------------------------------
 
-    private static Dir BuildTree(IReadOnlyList<ProsperoPs5InnerFile> files)
+    private static Dir BuildTree(IReadOnlyList<ProsperoPs5InnerFile> files, IReadOnlyList<string>? directories = null)
     {
         var uroot = new Dir { Name = "uroot", FullPath = "" };
         var dirLookup = new Dictionary<string, Dir>(StringComparer.Ordinal) { [""] = uroot };
@@ -565,6 +596,8 @@ public sealed class ProsperoPs5InnerImageAssembler
             return dir;
         }
 
+        if (directories is not null)
+            foreach (string path in directories.OrderBy(p => p, StringComparer.Ordinal)) GetDir(path.TrimStart('/'));
         foreach (var f in files.OrderBy(f => f.Path, StringComparer.Ordinal))
         {
             string path = f.Path.StartsWith('/') ? f.Path[1..] : f.Path;
@@ -688,6 +721,9 @@ public sealed class ProsperoPs5InnerImageAssembler
         // super-root dirents, the inode/apr flat-path tables, the afid table, then every directory's
         // dirent block (uroot, sub-directories in pre-order). Their logical offsets are consecutive
         // 64 KiB blocks starting at the metadata-region base.
+        foreach (var d in dirsPreOrder)
+            if (d.SubDirs.Count > ushort.MaxValue - (d == uroot ? 3 : 2))
+                throw new NotSupportedException("A directory has too many subdirectories for the PFS link-count field: " + d.FullPath);
         int inodeFltBlocks = ProsperoPs5InnerMetadata.BlocksForBytes(
             checked(ProsperoPs5FlatPathTable.HeaderSize + 16L * (dirsPreOrder.Count - 1 + fileNodes.Count)));
         int aprFltBlocks = ProsperoPs5InnerMetadata.BlocksForBytes(

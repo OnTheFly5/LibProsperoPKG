@@ -25,6 +25,7 @@ internal static class PackageStreamingTests
         DlcModes();
         HomebrewMode();
         ModeOptions();
+        EmptyDirectories();
     }
 
     private static byte[] Elf()
@@ -580,6 +581,79 @@ internal static class PackageStreamingTests
         var naps = ProsperoDinodeS32.ReadFromStream(reader);
         var mount = ProsperoPs5InnerImageReader.ReconstructMount(outer.AsSpan(inner.db[0].block * B, (int)inner.Size).ToArray(), outer.AsSpan(naps.db[0].block * B, (int)naps.Size).ToArray(), result.InnerLogicalSize);
         return ProsperoPs5InnerImageReader.ReadFileTree(mount.Mount, mount.SuperblockOffset).Select(f => f.Path).ToArray();
+    }
+
+    private static void EmptyDirectories()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-directories-stream-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            Directory.CreateDirectory(Path.Combine(source, "emptydir"));
+            Directory.CreateDirectory(Path.Combine(source, "nested", "child"));
+            Directory.CreateDirectory(Path.Combine(source, "sce_sys", "deep", "empty"));
+            var snapshot = Snapshot(source);
+            var catalog = ProsperoStreamingFolderSource.Inspect(source);
+            var files = ProsperoStreamingCatalogSource.Create(catalog, new('0', 32));
+            foreach (bool kraken in new[] { false, true })
+            {
+                using var image = new MemoryStream();
+                var layout = new ProsperoPs5InnerImageAssembler(12345678, 0, kraken).Write(image, files,
+                    directories: catalog.Directories.Select(d => d.Path).ToArray());
+                var dirs = ProsperoPs5InnerImageReader.ReadDirectoryTreeFromMetadata(layout.MetadataPlaintext, layout.MetaBaseLogical);
+                foreach (string name in new[] { "emptydir", "nested", "nested/child", "sce_sys/deep", "sce_sys/deep/empty" })
+                    Program.Equal(true, dirs.Contains(name), "empty directory in image metadata: " + name);
+                string target = Path.Combine(root, $"dirs-{kraken}.pkg");
+                var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                    SourceFolder = source, OutputPath = target, UseKraken = kraken,
+                    ImageSeed = new byte[16], Timestamp = DateTimeOffset.FromUnixTimeSeconds(12345678) });
+                var recovered = RecoveredDirectories(target, result);
+                foreach (string name in new[] { "emptydir", "nested", "nested/child", "sce_sys/deep", "sce_sys/deep/empty" })
+                    Program.Equal(true, recovered.Contains(name), "empty directory in package: " + name);
+            }
+            foreach (var (name, state) in snapshot) Program.Equal(state, Snapshot(source)[name], "empty directory packaging preserves source");
+            var assembler = new ProsperoPs5InnerImageAssembler(0, 0, false);
+            var single = new[] { new ProsperoPs5InnerFileSource { Path = "/file", Length = 1, OpenRead = () => new MemoryStream(new byte[] { 1 }) } };
+            Program.Throws<ArgumentException>(() => assembler.Write(Stream.Null, single, directories: new[] { "/file" }));
+            Program.Throws<ArgumentException>(() => assembler.Write(Stream.Null, single, directories: new[] { "/dir", "/DIR" }));
+            var tooMany = Enumerable.Range(0, 65533).Select(i => "/dir" + i.ToString("D5")).ToArray();
+            Program.Throws<NotSupportedException>(() => assembler.Write(Stream.Null, single, directories: tooMany));
+            Program.Throws<NotSupportedException>(() => assembler.Write(Stream.Null, single, directories: new[] { "/não" }));
+            Program.Throws<NotSupportedException>(() => ProsperoPs5FlatPathTable.HashPath("/não"));
+            Program.Throws<ArgumentException>(() => ProsperoPs5FlatPathTable.HashPath("/bad\0name"));
+            Program.Throws<NotSupportedException>(() => new ProsperoPfsDirent { Name = "não" });
+            byte[] badDirent = new byte[24];
+            BinaryPrimitives.WriteInt32LittleEndian(badDirent.AsSpan(4), (int)ProsperoDirentType.File);
+            BinaryPrimitives.WriteInt32LittleEndian(badDirent.AsSpan(8), 1);
+            BinaryPrimitives.WriteInt32LittleEndian(badDirent.AsSpan(12), 24);
+            badDirent[16] = 0xff;
+            Program.Throws<InvalidDataException>(() => ProsperoPfsDirent.ReadFromStream(new MemoryStream(badDirent)));
+            string changed = Path.Combine(root, "changed.pkg");
+            Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = changed }, progress: p => {
+                    if (p.Stage == "Writing PFS") Directory.Delete(Path.Combine(source, "emptydir"));
+                }));
+            Program.Equal(false, File.Exists(changed) || File.Exists(changed + ".part"), "changed empty directory aborts and cleans up output");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static string[] RecoveredDirectories(string target, ProsperoStreamingPackageResult result)
+    {
+        byte[] package = File.ReadAllBytes(target);
+        int sbIndex = checked((int)(BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20)) / B - 1));
+        int innerBlocks = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(package.AsSpan(0x90)));
+        byte[] outer = package.AsSpan(B, (int)result.PfsSize).ToArray();
+        var kinds = Enumerable.Range(0, outer.Length / B).Select(i => i == sbIndex ? ProsperoOuterBlockKind.Plaintext : i < innerBlocks ? ProsperoOuterBlockKind.Data : ProsperoOuterBlockKind.Signed).ToArray();
+        var (tweak, key) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ProsperoPfsKeys.DeriveEkpfs(Id, new('0', 32)), new byte[16]);
+        ProsperoOuterPfsImage.Transform(outer, tweak, key, B, kinds, encrypt: false);
+        using var reader = new MemoryStream(outer);
+        reader.Position = (sbIndex + 1L) * B + 3 * ProsperoDinodeS32.SizeOf;
+        var inner = ProsperoDinodeS32.ReadFromStream(reader);
+        var naps = ProsperoDinodeS32.ReadFromStream(reader);
+        var mount = ProsperoPs5InnerImageReader.ReconstructMount(outer.AsSpan(inner.db[0].block * B, (int)inner.Size).ToArray(), outer.AsSpan(naps.db[0].block * B, (int)naps.Size).ToArray(), result.InnerLogicalSize);
+        return ProsperoPs5InnerImageReader.ReadDirectoryTree(mount.Mount, mount.SuperblockOffset).ToArray();
     }
 
     private sealed class SyntheticElfReader(byte[] header, long length, Action<int> onRead) : Stream

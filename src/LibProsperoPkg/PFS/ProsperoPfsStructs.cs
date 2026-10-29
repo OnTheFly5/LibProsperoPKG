@@ -527,6 +527,8 @@ public class ProsperoPfsDirent
         get { return name; }
         set
         {
+            ArgumentNullException.ThrowIfNull(value);
+            if (value.Any(c => c > 0x7f)) throw new NotSupportedException("Non-ASCII PFS directory names are not supported: " + value);
             name = value;
             NameLength = name.Length;
             EntSize = CalculateEntSize();
@@ -566,6 +568,7 @@ public class ProsperoPfsDirent
             EntSize = s.ReadInt32LE(),
         };
         d.name = s.ReadASCIINullTerminated(d.NameLength);
+        if (d.name.Any(c => c > 0x7f)) throw new InvalidDataException("Unsupported PFS directory name encoding.");
         s.Position = pos + d.EntSize;
         return d;
     }

@@ -15,6 +15,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace LibProsperoPkg.PFS;
@@ -50,6 +51,10 @@ public static class ProsperoPs5FlatPathTable
     /// </summary>
     public static ulong HashPath(string path)
     {
+        ArgumentNullException.ThrowIfNull(path);
+        if (path.Any(c => c > 0x7f))
+            throw new NotSupportedException("Non-ASCII PFS path hashing is not established: " + path);
+        if (path.Any(char.IsControl)) throw new ArgumentException("PFS paths cannot contain control characters.", nameof(path));
         if (path.Length > 0 && path[0] == '/')
             path = path.Substring(1);
         return HashBytes(Encoding.ASCII.GetBytes(path.ToUpperInvariant()));

@@ -190,7 +190,9 @@ public static partial class ProsperoPkgBuilder
                 {
                     Name = "pfs_image.dat", WritePayload = sink =>
                     {
-                        inner = assembler.Write(sink, innerFiles, token);
+                        catalog.Validate();
+                        inner = assembler.Write(sink, innerFiles, token, catalog.Directories.Select(d => d.Path).ToArray());
+                        catalog.Validate();
                         return checked(inner.Ndblock * BlockSize);
                     },
                 },

@@ -41,8 +41,14 @@ use at most 64 KiB and segments may overlap or appear out of order. Disabling
 the option rejects raw executable ELF modules; existing SELF modules are left
 unchanged. This debug fake signature does not establish console compatibility.
 The lower-level folder-source helper does not enable conversion by itself.
-The profile requires ASCII names, rejects links/collisions, and omits empty
-directories like the existing file-only assembler. Application inputs require
+The profile requires ASCII names and rejects links/collisions. The streaming
+builder preserves catalogued directories, including empty directories, in the
+inner image. The exact non-ASCII dirent and PS5 flat-path hashing rules are not
+established, so non-ASCII names fail explicitly rather than being replaced.
+The independent MkPFS implementation likewise rejects non-ASCII dirent names
+(see https://github.com/PSBrew/MkPFS/blob/main/mkpfs/pfs.py); that is evidence
+of its own support boundary, not proof that consoles reject Unicode names.
+Application inputs require
 eboot.bin; output within the source, including resolved directory aliases, fails.
 
 `ProsperoStreamingPackageOptions.Mode` selects Application, Homebrew, DLC with

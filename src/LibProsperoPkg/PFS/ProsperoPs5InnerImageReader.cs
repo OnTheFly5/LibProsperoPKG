@@ -199,8 +199,25 @@ public static class ProsperoPs5InnerImageReader
         return ReadFileTreeCore(metadata, 0, metadataLogicalBase);
     }
 
+    /// <summary>Read all user-root directory paths from a reconstructed mount, including empty directories.</summary>
+    public static IReadOnlyList<string> ReadDirectoryTree(byte[] mount, long metaBase)
+    {
+        var directories = new List<string>();
+        _ = ReadFileTreeCore(mount, metaBase, 0, directories);
+        return directories.AsReadOnly();
+    }
+
+    /// <summary>Read all user-root directory paths from retained plaintext metadata, including empty directories.</summary>
+    public static IReadOnlyList<string> ReadDirectoryTreeFromMetadata(byte[] metadata, long metadataLogicalBase)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(metadataLogicalBase);
+        var directories = new List<string>();
+        _ = ReadFileTreeCore(metadata, 0, metadataLogicalBase, directories);
+        return directories.AsReadOnly();
+    }
+
     private static IReadOnlyList<ProsperoPs5InnerFileEntry> ReadFileTreeCore(
-        byte[] mount, long metaBase, long logicalBase)
+        byte[] mount, long metaBase, long logicalBase, List<string>? directories = null)
     {
         ArgumentNullException.ThrowIfNull(mount);
         ArgumentOutOfRangeException.ThrowIfNegative(metaBase);
@@ -240,7 +257,7 @@ public static class ProsperoPs5InnerImageReader
 
         // Walk the directory tree from the super-root (inode 0), collecting files under "uroot".
         var files = new List<ProsperoPs5InnerFileEntry>();
-        WalkDir(mount, logicalBase, blockSize, nodes, 0, "", underUroot: false, files, new HashSet<uint>());
+        WalkDir(mount, logicalBase, blockSize, nodes, 0, "", underUroot: false, files, new HashSet<uint>(), directories);
         return files;
     }
 
@@ -253,7 +270,7 @@ public static class ProsperoPs5InnerImageReader
     }
 
     private static void WalkDir(byte[] mount, long logicalBase, int blockSize, InnerInode[] nodes, uint dirInode,
-        string path, bool underUroot, List<ProsperoPs5InnerFileEntry> files, HashSet<uint> seen)
+        string path, bool underUroot, List<ProsperoPs5InnerFileEntry> files, HashSet<uint> seen, List<string>? directories)
     {
         if (dirInode >= nodes.Length || !seen.Add(dirInode))
             return;
@@ -311,7 +328,10 @@ public static class ProsperoPs5InnerImageReader
                 : path + "/" + name;
 
             if (d.Type == ProsperoDirentType.Directory)
-                WalkDir(mount, logicalBase, blockSize, nodes, d.InodeNumber, childPath, childUnderUroot, files, seen);
+            {
+                if (underUroot && childPath.Length > 0) directories?.Add(childPath);
+                WalkDir(mount, logicalBase, blockSize, nodes, d.InodeNumber, childPath, childUnderUroot, files, seen, directories);
+            }
             else if (d.Type == ProsperoDirentType.File && underUroot && childPath.Length > 0)
                 files.Add(new ProsperoPs5InnerFileEntry
                 {
