@@ -33,7 +33,14 @@ The folder catalog filters CNT/project files and injects missing keystone/about
 metadata in RAM. Small UCP repair is capped at 16 MiB/file and 64 MiB overlays.
 CNT inputs are frozen before payload generation (64 MiB total, 4 MiB param.json),
 with no late filesystem fallback. Source files/timestamps remain unchanged.
-Raw ELF conversion is not supplied: executables must already be prepared SELF.
+By default, `ProsperoStreamingPackageOptions.SignExecutableModules` converts raw
+64-bit little-endian ELF modules into debug fake-SELF images without writing to
+the source or retaining module payloads. It hashes the normalized ELF in one
+pass, then reopens the catalog reader for each selected program segment; reads
+use at most 64 KiB and segments may overlap or appear out of order. Disabling
+the option rejects raw executable ELF modules; existing SELF modules are left
+unchanged. This debug fake signature does not establish console compatibility.
+The lower-level folder-source helper does not enable conversion by itself.
 The profile requires ASCII names, rejects links/collisions, and omits empty
 directories like the existing file-only assembler. Application inputs require
 eboot.bin; output within the source, including resolved directory aliases, fails.

@@ -17,7 +17,7 @@ namespace LibProsperoPkg.PKG;
 public static class ProsperoStreamingCatalogSource
 {
     public static IReadOnlyList<ProsperoPs5InnerFileSource> Create(ProsperoSourceCatalog catalog, string passcode,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, bool signExecutableModules = false)
     {
         ArgumentNullException.ThrowIfNull(catalog);
         if (passcode is null || passcode.Length != 32 || passcode.Any(c => c > 0x7f))
@@ -64,9 +64,27 @@ public static class ProsperoStreamingCatalogSource
         }
         var result = new List<ProsperoPs5InnerFileSource>();
         foreach (var file in files.Values)
-            if (!overlays.ContainsKey(file.Path))
+        {
+            if (overlays.ContainsKey(file.Path)) continue;
+            ProsperoStreamingFself? converted = null;
+            if (signExecutableModules)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                using var reader = file.OpenRead();
+                byte[] header = new byte[(int)Math.Min(file.Length, ProsperoInnerFileClassifier.HeaderLength)];
+                reader.ReadExactly(header);
+                bool elf = header.Length >= 4 && header[0] == 0x7f && header[1] == (byte)'E' && header[2] == (byte)'L' && header[3] == (byte)'F';
+                if (ProsperoInnerFileClassifier.Classify(header) == ProsperoInnerFilePolicy.RequiresModuleConversion ||
+                    elf && header.Length < ProsperoInnerFileClassifier.HeaderLength)
+                    converted = ProsperoStreamingFself.Create(file, cancellationToken);
+            }
+            if (converted is null)
                 result.Add(new ProsperoPs5InnerFileSource { Path = file.Path, Length = file.Length,
                     OpenRead = () => OpenPrepared(file, cancellationToken) });
+            else
+                result.Add(new ProsperoPs5InnerFileSource { Path = file.Path, Length = converted.Length,
+                    OpenRead = () => converted.OpenRead(cancellationToken) });
+        }
         foreach (var (path, bytes) in overlays)
         {
             foreach (var directory in catalog.Directories)

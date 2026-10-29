@@ -21,9 +21,10 @@ internal static class PackageStreamingTests
         FrozenMetadataAndBudgets();
         ParamMetadataEdits();
         ManifestMetadataEdits();
+        StreamingElfConversion();
     }
 
-    private static byte[] Module()
+    private static byte[] Elf()
     {
         var elf = new byte[0x180];
         new byte[] { 0x7f, (byte)'E', (byte)'L', (byte)'F', 2, 1, 1 }.CopyTo(elf, 0);
@@ -42,8 +43,10 @@ internal static class PackageStreamingTests
         BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x68), 0x80);
         BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x70), 0x1000);
         elf.AsSpan(0x100).Fill(0x90);
-        return ProsperoFself.MakeFself(elf);
+        return elf;
     }
+
+    private static byte[] Module() => ProsperoFself.MakeFself(Elf());
 
     private static string Setup(string directory)
     {
@@ -184,8 +187,8 @@ internal static class PackageStreamingTests
             Program.Equal(false, File.Exists(target) || File.Exists(target + ".part"), "late failure removes owned partial");
             byte[] original = File.ReadAllBytes(Path.Combine(source, "eboot.bin"));
             File.WriteAllBytes(Path.Combine(source, "eboot.bin"), new byte[] { 0x7f, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 62, 0 });
-            Program.Throws<NotSupportedException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(target)));
-            Program.Equal(false, File.Exists(target) || File.Exists(target + ".part"), "raw module failure leaves no package");
+            Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.BuildLocalStreaming(Options(target)));
+            Program.Equal(false, File.Exists(target) || File.Exists(target + ".part"), "invalid module failure leaves no package");
             File.WriteAllBytes(Path.Combine(source, "eboot.bin"), original);
             string alias = Path.Combine(root, "source-alias");
             if (!OperatingSystem.IsWindows())
@@ -322,6 +325,114 @@ internal static class PackageStreamingTests
             Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = Path.Combine(root, "collision.pkg"), MetadataEdits = new() { Manifest = new() { Path = "/sce_sys/manifest.json" } } }));
         }
         finally { Directory.Delete(root, true); }
+    }
+
+    private static void StreamingElfConversion()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-elf-stream-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            string path = Path.Combine(source, "eboot.bin");
+            byte[] elf = Elf();
+            // Exercise overlapping and non-monotonic segment reads, including the normalized header.
+            Array.Resize(ref elf, 0x400);
+            BinaryPrimitives.WriteUInt16LittleEndian(elf.AsSpan(0x38), 3);
+            BinaryPrimitives.WriteUInt32LittleEndian(elf.AsSpan(0x78), 1);
+            BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x80), 0);
+            BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0x98), 0x100);
+            BinaryPrimitives.WriteUInt32LittleEndian(elf.AsSpan(0xb0), 1);
+            BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0xb8), 0x100);
+            BinaryPrimitives.WriteUInt64LittleEndian(elf.AsSpan(0xd0), 0x140);
+            File.WriteAllBytes(path, elf);
+            byte[] expected = ProsperoFself.MakeFself(elf);
+            var catalog = ProsperoStreamingFolderSource.Inspect(source);
+            var input = catalog.Files.Single(f => f.Path == "/eboot.bin");
+            var plan = ProsperoStreamingFself.Create(input, CancellationToken.None);
+            Program.Equal((long)expected.Length, plan.Length, "streamed SELF length");
+            using (var converted = plan.OpenRead(CancellationToken.None))
+            using (var output = new MemoryStream())
+            {
+                byte[] small = new byte[17];
+                int n; while ((n = converted.Read(small)) != 0) output.Write(small, 0, n);
+                Same(expected, output.ToArray(), "streamed SELF matches in-memory converter");
+            }
+            using (var cancelled = new CancellationTokenSource())
+            {
+                cancelled.Cancel();
+                Program.Throws<OperationCanceledException>(() => ProsperoStreamingFself.Create(input, cancelled.Token));
+                using var converted = plan.OpenRead(cancelled.Token);
+                Program.Throws<OperationCanceledException>(() => converted.ReadByte());
+            }
+            // A synthetic large reader measures requests without retaining the payload.
+            const int largeSize = 32 * 1024 * 1024;
+            byte[] largeHeader = Elf();
+            BinaryPrimitives.WriteUInt64LittleEndian(largeHeader.AsSpan(0x60), largeSize - 0x100);
+            int maximumRequest = 0;
+            var large = new ProsperoSourceFile { Path = "/large.elf", Length = largeSize,
+                Validate = () => { }, OpenRead = () => new SyntheticElfReader(largeHeader, largeSize, n => maximumRequest = Math.Max(maximumRequest, n)) };
+            var largePlan = ProsperoStreamingFself.Create(large, CancellationToken.None);
+            using (var converted = largePlan.OpenRead(CancellationToken.None)) converted.CopyTo(Stream.Null, 1024 * 1024);
+            Program.Equal(true, maximumRequest <= 64 * 1024, "ELF source reads stay bounded");
+            Program.Equal(true, largePlan.Length > largeSize - 0x100, "large SELF length includes metadata");
+            using (var duringHash = new CancellationTokenSource())
+            {
+                int reads = 0;
+                var cancelSource = new ProsperoSourceFile { Path = "/cancel.elf", Length = largeSize,
+                    Validate = () => { }, OpenRead = () => new SyntheticElfReader(largeHeader, largeSize,
+                        _ => { if (++reads == 4) duringHash.Cancel(); }) };
+                Program.Throws<OperationCanceledException>(() => ProsperoStreamingFself.Create(cancelSource, duringHash.Token));
+            }
+            var before = Snapshot(source);
+            string expectedRoot = Path.Combine(root, "prepared");
+            Directory.CreateDirectory(expectedRoot);
+            string prepared = Setup(expectedRoot);
+            File.WriteAllBytes(Path.Combine(prepared, "eboot.bin"), expected);
+            foreach (bool kraken in new[] { false, true })
+            {
+                string target = Path.Combine(root, $"converted-{kraken}.pkg");
+                var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                    SourceFolder = source, OutputPath = target, UseKraken = kraken,
+                    ImageSeed = new byte[16], Timestamp = DateTimeOffset.FromUnixTimeSeconds(12345678) });
+                VerifyPackage(target, prepared, result, kraken);
+            }
+            foreach (var (name, state) in before) Program.Equal(state, Snapshot(source)[name], "ELF conversion preserves source");
+            Program.Throws<NotSupportedException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = Path.Combine(root, "unsigned.pkg"), SignExecutableModules = false }));
+            Program.Equal(false, File.Exists(Path.Combine(root, "unsigned.pkg")), "disabled signing rejects raw ELF");
+            File.AppendAllText(path, "changed");
+            Program.Throws<InvalidDataException>(() => plan.OpenRead(CancellationToken.None));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private sealed class SyntheticElfReader(byte[] header, long length, Action<int> onRead) : Stream
+    {
+        private long position;
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+        public override int Read(Span<byte> buffer)
+        {
+            onRead(buffer.Length);
+            int n = (int)Math.Min(buffer.Length, length - position);
+            buffer[..n].Clear();
+            if (position < header.Length)
+            {
+                int fromHeader = (int)Math.Min(n, header.Length - position);
+                header.AsSpan((int)position, fromHeader).CopyTo(buffer);
+            }
+            position += n;
+            return n;
+        }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private sealed class CallbackSink : IProsperoStreamingPackageOutput, IDisposable

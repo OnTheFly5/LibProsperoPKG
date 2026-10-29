@@ -25,6 +25,8 @@ public sealed class ProsperoStreamingPackageOptions
     public string Passcode { get; init; } = new('0', 32);
     public ProsperoVolumeType VolumeType { get; init; } = ProsperoVolumeType.Application;
     public bool UseKraken { get; init; } = true;
+    /// <summary>Convert raw executable ELF modules to debug fake-SELF images without changing the source.</summary>
+    public bool SignExecutableModules { get; init; } = true;
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
     /// <summary>Optional fixed 16-byte outer seed for reproducible image geometry/encryption.</summary>
     public byte[]? ImageSeed { get; init; }
@@ -125,7 +127,7 @@ public static partial class ProsperoPkgBuilder
         progress?.Invoke(new("Inspecting source", 0));
         var catalog = source ?? ProsperoStreamingFolderSource.Inspect(sourceFolder, cancellationToken);
         catalog = ProsperoStreamingMetadata.ApplyManifest(catalog, options.MetadataEdits?.Manifest, cancellationToken);
-        var innerFiles = ProsperoStreamingCatalogSource.Create(catalog, options.Passcode, cancellationToken);
+        var innerFiles = ProsperoStreamingCatalogSource.Create(catalog, options.Passcode, cancellationToken, options.SignExecutableModules);
         if (options.VolumeType == ProsperoVolumeType.Application && !innerFiles.Any(f => f.Path == "/eboot.bin"))
             throw new InvalidDataException("Prepared application source requires eboot.bin.");
         var overrides = SnapshotStreamingOverrides(options.MetadataOverrides);
