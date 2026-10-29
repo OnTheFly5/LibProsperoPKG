@@ -141,6 +141,7 @@ public static partial class ProsperoPkgBuilder
         {
             param.ContentId = contentId;
             paramBytes = Encoding.UTF8.GetBytes(param.ToJson());
+            if (paramBytes.Length > 4 * 1024 * 1024) throw new InvalidDataException("param.json exceeds the 4 MiB metadata limit.");
         }
         overrides["param.json"] = paramBytes;
         byte[] seed = options.ImageSeed?.ToArray() ?? RandomNumberGenerator.GetBytes(16);

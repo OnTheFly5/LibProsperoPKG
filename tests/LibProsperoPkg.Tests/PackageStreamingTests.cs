@@ -272,6 +272,12 @@ internal static class PackageStreamingTests
             pkg = File.ReadAllBytes(generatedPath);
             param = ProsperoParam.Parse(Encoding.UTF8.GetString(pkg.AsSpan((int)((long)parsed.Fih!.EmbeddedCntOffset + (long)entry.DataOffset), (int)entry.DataSize)).TrimEnd('\0'));
             Program.Equal("Generated", param.GetTitleName("en-US"), "generated param in CNT");
+            string prefix = "{\"contentId\":\"" + Id + "\",\"padding\":\"";
+            string suffix = "\"}";
+            byte[] atLimit = Encoding.UTF8.GetBytes(prefix + new string('x', 4 * 1024 * 1024 - prefix.Length - suffix.Length) + suffix);
+            Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = Path.Combine(root, "oversize-rewrite.pkg"), ContentId = Id,
+                MetadataOverrides = new Dictionary<string, byte[]> { ["param.json"] = atLimit } }));
             Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = Path.Combine(root, "invalid.pkg"), ContentId = Id, MetadataEdits = new() { GenerateMissingParam = true } }));
         }
         finally { Directory.Delete(root, true); }
