@@ -30,6 +30,8 @@ public sealed class ProsperoStreamingPackageOptions
     public byte[]? ImageSeed { get; init; }
     /// <summary>Small CNT metadata replacements relative to sce_sys; source files remain untouched.</summary>
     public IReadOnlyDictionary<string, byte[]>? MetadataOverrides { get; init; }
+    /// <summary>Optional edits and generation of package metadata, applied only in memory.</summary>
+    public ProsperoStreamingMetadataEdits? MetadataEdits { get; init; }
 }
 
 public readonly record struct ProsperoStreamingProgress(string Stage, long BytesWritten);
@@ -122,13 +124,14 @@ public static partial class ProsperoPkgBuilder
         cancellationToken.ThrowIfCancellationRequested();
         progress?.Invoke(new("Inspecting source", 0));
         var catalog = source ?? ProsperoStreamingFolderSource.Inspect(sourceFolder, cancellationToken);
+        catalog = ProsperoStreamingMetadata.ApplyManifest(catalog, options.MetadataEdits?.Manifest, cancellationToken);
         var innerFiles = ProsperoStreamingCatalogSource.Create(catalog, options.Passcode, cancellationToken);
         if (options.VolumeType == ProsperoVolumeType.Application && !innerFiles.Any(f => f.Path == "/eboot.bin"))
             throw new InvalidDataException("Prepared application source requires eboot.bin.");
         var overrides = SnapshotStreamingOverrides(options.MetadataOverrides);
         SnapshotStreamingMetadata(catalog, overrides, cancellationToken);
-        byte[] paramBytes = overrides.TryGetValue("param.json", out var supplied)
-            ? supplied : throw new FileNotFoundException("Prepared source requires sce_sys/param.json.");
+        byte[]? supplied = overrides.GetValueOrDefault("param.json");
+        byte[] paramBytes = ProsperoStreamingMetadata.ApplyParam(supplied, options.ContentId, options.MetadataEdits);
         if (paramBytes.Length > 4 * 1024 * 1024) throw new InvalidDataException("param.json exceeds the 4 MiB metadata limit.");
         var param = ProsperoParam.Parse(Encoding.UTF8.GetString(paramBytes));
         string contentId = options.ContentId ?? param.ContentId

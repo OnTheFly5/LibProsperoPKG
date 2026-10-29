@@ -19,6 +19,8 @@ internal static class PackageStreamingTests
         CallbackOutput();
         FailedJobsLeaveNoOutput();
         FrozenMetadataAndBudgets();
+        ParamMetadataEdits();
+        ManifestMetadataEdits();
     }
 
     private static byte[] Module()
@@ -234,6 +236,84 @@ internal static class PackageStreamingTests
                 SourceFolder = source, OutputPath = rejected,
             }));
             Program.Equal(false, File.Exists(rejected) || File.Exists(rejected + ".part"), "oversized metadata rejected before output creation");
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static void ParamMetadataEdits()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-param-overlay-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            string paramPath = Path.Combine(source, "sce_sys", "param.json");
+            var original = Snapshot(source);
+            var edits = new ProsperoStreamingMetadataEdits { TitleId = "PPSA11111", TitleName = "Edited title", Version = "02.34", DrmType = ProsperoDrmType.Free };
+            string output = Path.Combine(root, "edited.pkg");
+            ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = output, MetadataEdits = edits });
+            var parsed = ProsperoPkgReader.Read(output);
+            var entry = parsed.Entries.Single(e => e.RawId == 0x2000);
+            byte[] pkg = File.ReadAllBytes(output);
+            var param = ProsperoParam.Parse(Encoding.UTF8.GetString(pkg.AsSpan((int)((long)parsed.Fih!.EmbeddedCntOffset + (long)entry.DataOffset), (int)entry.DataSize)).TrimEnd('\0'));
+            Program.Equal("PPSA11111", param.TitleId, "edited title id in CNT");
+            Program.Equal("Edited title", param.GetTitleName("en-US"), "edited title in CNT");
+            Program.Equal("02.34", param.MasterVersion, "edited master version in CNT");
+            Program.Equal("02.034.000", param.ContentVersion, "edited content version in CNT");
+            Program.Equal("free", param.ApplicationDrmType, "edited DRM in CNT");
+            foreach (var (path, state) in original) Program.Equal(state, Snapshot(source)[path], "metadata edits preserve source");
+            File.Delete(paramPath);
+            var generated = new ProsperoStreamingMetadataEdits { GenerateMissingParam = true, TitleId = "PPSA99099", TitleName = "Generated" };
+            string generatedPath = Path.Combine(root, "generated.pkg");
+            ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = generatedPath, ContentId = Id, MetadataEdits = generated });
+            Program.Equal(false, File.Exists(paramPath), "generated param stays out of source");
+            parsed = ProsperoPkgReader.Read(generatedPath);
+            entry = parsed.Entries.Single(e => e.RawId == 0x2000);
+            pkg = File.ReadAllBytes(generatedPath);
+            param = ProsperoParam.Parse(Encoding.UTF8.GetString(pkg.AsSpan((int)((long)parsed.Fih!.EmbeddedCntOffset + (long)entry.DataOffset), (int)entry.DataSize)).TrimEnd('\0'));
+            Program.Equal("Generated", param.GetTitleName("en-US"), "generated param in CNT");
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = Path.Combine(root, "invalid.pkg"), ContentId = Id, MetadataEdits = new() { GenerateMissingParam = true } }));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static void ManifestMetadataEdits()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-manifest-overlay-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            string path = Path.Combine(source, "manifest.json");
+            File.WriteAllText(path, "{\"applicationName\":\"Before\",\"custom\":123}");
+            var snapshot = Snapshot(source);
+            var edits = new ProsperoStreamingMetadataEdits { Manifest = new() { Path = "/manifest.json", ApplicationName = "After", TwinTurbo = true } };
+            string target = Path.Combine(root, "manifest.pkg");
+            var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = target, ImageSeed = new byte[16], MetadataEdits = edits });
+            byte[] package = File.ReadAllBytes(target);
+            int sbIndex = checked((int)(BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20)) / B - 1));
+            int innerBlocks = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(package.AsSpan(0x90)));
+            byte[] outer = package.AsSpan(B, (int)result.PfsSize).ToArray();
+            var kinds = Enumerable.Range(0, outer.Length / B).Select(i => i == sbIndex ? ProsperoOuterBlockKind.Plaintext : i < innerBlocks ? ProsperoOuterBlockKind.Data : ProsperoOuterBlockKind.Signed).ToArray();
+            var (tweak, key) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ProsperoPfsKeys.DeriveEkpfs(Id, new('0', 32)), new byte[16]);
+            ProsperoOuterPfsImage.Transform(outer, tweak, key, B, kinds, encrypt: false);
+            using var reader = new MemoryStream(outer);
+            reader.Position = (sbIndex + 1L) * B + 3 * ProsperoDinodeS32.SizeOf;
+            var inner = ProsperoDinodeS32.ReadFromStream(reader);
+            var naps = ProsperoDinodeS32.ReadFromStream(reader);
+            var mount = ProsperoPs5InnerImageReader.ReconstructMount(outer.AsSpan(inner.db[0].block * B, (int)inner.Size).ToArray(), outer.AsSpan(naps.db[0].block * B, (int)naps.Size).ToArray(), result.InnerLogicalSize);
+            var entry = ProsperoPs5InnerImageReader.ReadFileTree(mount.Mount, mount.SuperblockOffset).Single(f => f.Path == "manifest.json");
+            var manifest = ProsperoManifest.Parse(Encoding.UTF8.GetString(mount.Mount.AsSpan((int)entry.LogicalOffset, (int)entry.Size)));
+            Program.Equal("After", manifest.ApplicationName, "manifest overlay in inner image");
+            Program.Equal(true, manifest.TwinTurbo, "manifest flag in inner image");
+            Program.Equal(123, (int)manifest.Root["custom"]!, "unknown manifest field retained");
+            foreach (var (name, state) in snapshot) Program.Equal(state, Snapshot(source)[name], "manifest source preserved");
+            File.Delete(path);
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = Path.Combine(root, "missing.pkg"), MetadataEdits = edits }));
+            var generated = new ProsperoStreamingMetadataEdits { Manifest = new() { Path = "/manifest.json", ApplicationName = "App", ApplicationVersion = "01.00", TitleId = "PPSA99099", RuntimeVersion = "1.0" } };
+            ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = Path.Combine(root, "generated-manifest.pkg"), MetadataEdits = generated });
+            Program.Equal(false, File.Exists(path), "generated manifest stays out of source");
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions { SourceFolder = source, OutputPath = Path.Combine(root, "collision.pkg"), MetadataEdits = new() { Manifest = new() { Path = "/sce_sys/manifest.json" } } }));
         }
         finally { Directory.Delete(root, true); }
     }
