@@ -23,7 +23,12 @@ public sealed class ProsperoStreamingPackageOptions
     /// <summary>Defaults to the supplied param.json contentId. An override is applied only in memory.</summary>
     public string? ContentId { get; init; }
     public string Passcode { get; init; } = new('0', 32);
+    /// <summary>Optional named build mode; when absent the existing VolumeType is used.</summary>
+    public ProsperoPackageMode? Mode { get; init; }
     public ProsperoVolumeType VolumeType { get; init; } = ProsperoVolumeType.Application;
+    /// <summary>Relative path to the Homebrew main module, packaged as eboot.bin.</summary>
+    public string HomebrewMainModule { get; init; } = "eboot.bin";
+    public ProsperoApplicationType ApplicationType { get; init; } = ProsperoApplicationType.PaidStandaloneFullApp;
     public bool UseKraken { get; init; } = true;
     /// <summary>Convert raw executable ELF modules to debug fake-SELF images without changing the source.</summary>
     public bool SignExecutableModules { get; init; } = true;
@@ -118,8 +123,16 @@ public static partial class ProsperoPkgBuilder
         ArgumentNullException.ThrowIfNull(options);
         if (source is null) ArgumentException.ThrowIfNullOrWhiteSpace(options.SourceFolder);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.OutputPath);
-        if (options.Passcode is not { Length: 32 }) throw new ArgumentException("Passcode must contain 32 characters.", nameof(options));
-        if (!Enum.IsDefined(options.VolumeType)) throw new ArgumentOutOfRangeException(nameof(options));
+        string passcode = string.IsNullOrEmpty(options.Passcode) ? new string('0', 32) : options.Passcode;
+        if (passcode.Length != 32) throw new ArgumentException("Passcode must contain 32 characters.", nameof(options));
+        if (!Enum.IsDefined(options.VolumeType) || !Enum.IsDefined(options.ApplicationType) ||
+            (options.Mode is { } mode && !Enum.IsDefined(mode))) throw new ArgumentOutOfRangeException(nameof(options));
+        var volumeType = options.Mode is { } selectedMode
+            ? ProsperoPackageBuilder.ProsperoVolumeTypeForMode(selectedMode) : options.VolumeType;
+        if (options.Mode is not null && options.VolumeType != ProsperoVolumeType.Application && options.VolumeType != volumeType)
+            throw new ArgumentException("Mode and volume type conflict.", nameof(options));
+        if (options.Mode != ProsperoPackageMode.Homebrew && options.HomebrewMainModule != "eboot.bin")
+            throw new ArgumentException("Homebrew main module applies only to Homebrew mode.", nameof(options));
         if (options.ImageSeed is not null && options.ImageSeed.Length != 16)
             throw new ArgumentException("Image seed must contain 16 bytes.", nameof(options));
         string sourceFolder = source is null ? Path.GetFullPath(options.SourceFolder) : "";
@@ -127,18 +140,24 @@ public static partial class ProsperoPkgBuilder
         progress?.Invoke(new("Inspecting source", 0));
         var catalog = source ?? ProsperoStreamingFolderSource.Inspect(sourceFolder, cancellationToken);
         catalog = ProsperoStreamingMetadata.ApplyManifest(catalog, options.MetadataEdits?.Manifest, cancellationToken);
-        var innerFiles = ProsperoStreamingCatalogSource.Create(catalog, options.Passcode, cancellationToken, options.SignExecutableModules);
-        if (options.VolumeType == ProsperoVolumeType.Application && !innerFiles.Any(f => f.Path == "/eboot.bin"))
+        if (options.Mode == ProsperoPackageMode.Homebrew)
+            catalog = ProsperoStreamingModes.Homebrew(catalog, options.HomebrewMainModule, options.MetadataEdits?.Manifest?.Path);
+        if (volumeType == ProsperoVolumeType.AdditionalContentNoData) ProsperoStreamingModes.ValidateNoData(catalog);
+        var innerFiles = ProsperoStreamingCatalogSource.Create(catalog, passcode, cancellationToken,
+            options.SignExecutableModules);
+        if (volumeType == ProsperoVolumeType.Application && !innerFiles.Any(f => f.Path == "/eboot.bin"))
             throw new InvalidDataException("Prepared application source requires eboot.bin.");
         var overrides = SnapshotStreamingOverrides(options.MetadataOverrides);
         SnapshotStreamingMetadata(catalog, overrides, cancellationToken);
         byte[]? supplied = overrides.GetValueOrDefault("param.json");
-        byte[] paramBytes = ProsperoStreamingMetadata.ApplyParam(supplied, options.ContentId, options.MetadataEdits);
+        byte[] paramBytes = ProsperoStreamingMetadata.ApplyParam(supplied, options.ContentId, options.MetadataEdits,
+            ProsperoApplicationTypes.ApplicationDrmType(options.ApplicationType) switch { "free" => ProsperoDrmType.Free, "freemium" => ProsperoDrmType.Freemium, _ => ProsperoDrmType.Standard });
         if (paramBytes.Length > 4 * 1024 * 1024) throw new InvalidDataException("param.json exceeds the 4 MiB metadata limit.");
         var param = ProsperoParam.Parse(Encoding.UTF8.GetString(paramBytes));
         string contentId = options.ContentId ?? param.ContentId
             ?? throw new InvalidDataException("param.json has no contentId; supply one explicitly.");
-        if (contentId.Length != 36) throw new ArgumentException("Content id must contain 36 characters.", nameof(options));
+        if (!ProsperoPackageBuilder.IsValidContentId(contentId)) throw new ArgumentException("Content id has an invalid format.", nameof(options));
+        _ = LibProsperoPkg.License.ProsperoDebugLicense.Create(contentId, passcode);
         if (options.ContentId is not null)
         {
             param.ContentId = contentId;
@@ -147,12 +166,12 @@ public static partial class ProsperoPkgBuilder
         }
         overrides["param.json"] = paramBytes;
         byte[] seed = options.ImageSeed?.ToArray() ?? RandomNumberGenerator.GetBytes(16);
-        byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(contentId, options.Passcode);
+        byte[] ekpfs = ProsperoPfsKeys.DeriveEkpfs(contentId, passcode);
         long seconds = options.Timestamp.ToUnixTimeSeconds();
         var props = new ProsperoPkgBuildProperties
         {
-            SourceFolder = sourceFolder, ContentId = contentId, Passcode = options.Passcode,
-            TimeStamp = options.Timestamp.UtcDateTime, VolumeType = options.VolumeType,
+            SourceFolder = sourceFolder, ContentId = contentId, Passcode = passcode,
+            TimeStamp = options.Timestamp.UtcDateTime, VolumeType = volumeType,
         };
         var assembler = new ProsperoPs5InnerImageAssembler(seconds, 0, options.UseKraken);
         return output =>

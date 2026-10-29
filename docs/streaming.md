@@ -45,6 +45,18 @@ The profile requires ASCII names, rejects links/collisions, and omits empty
 directories like the existing file-only assembler. Application inputs require
 eboot.bin; output within the source, including resolved directory aliases, fails.
 
+`ProsperoStreamingPackageOptions.Mode` selects Application, Homebrew, DLC with
+data, or entitlement-only DLC. If omitted, the existing `VolumeType` property
+is used. Homebrew maps the selected `HomebrewMainModule` to `eboot.bin` and
+includes `sce_sys`, `sce_module`, and any explicitly selected manifest from the
+source without staging a tree; it can generate a missing `sce_sys`/param from supplied metadata. Entitlement-only
+DLC rejects non-system payload files. All modes generate debug images with a
+derived mount key and no license requirement. A blank passcode means 32 zeroes.
+Application type supplies the DRM bucket for a generated param; an explicit
+metadata DRM edit overrides it. Existing param metadata is preserved unless
+explicitly edited. The default application type is paid standalone. These library
+options are not yet available through the application's native/UI interfaces.
+
 The existing SI format still limits aligned physical inner size to its 32-bit
 phdr field and file extents to 32-bit sizes. This path does not establish large
 game or target-console compatibility. FTP/RAR and the production callback/UI

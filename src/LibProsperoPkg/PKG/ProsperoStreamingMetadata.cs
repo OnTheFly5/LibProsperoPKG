@@ -82,7 +82,7 @@ internal static class ProsperoStreamingMetadata
         return new ProsperoSourceCatalog(catalog.Directories, catalog.Files.Where(f => f.Path != path).Append(replacement), catalog.Validate);
     }
 
-    internal static byte[] ApplyParam(byte[]? source, string? contentId, ProsperoStreamingMetadataEdits? edits)
+    internal static byte[] ApplyParam(byte[]? source, string? contentId, ProsperoStreamingMetadataEdits? edits, ProsperoDrmType defaultDrm)
     {
         if (source is { Length: > Limit }) throw new InvalidDataException("param.json exceeds the 4 MiB metadata limit.");
         if (source is null && edits?.GenerateMissingParam != true)
@@ -94,10 +94,14 @@ internal static class ProsperoStreamingMetadata
         {
             if (string.IsNullOrWhiteSpace(contentId) || string.IsNullOrWhiteSpace(edits.TitleId) || string.IsNullOrWhiteSpace(edits.TitleName))
                 throw new ArgumentException("Generating param.json requires a content ID, title ID and title name.");
-            param = ProsperoParam.CreateDefault(contentId, edits.TitleId, edits.TitleName, edits.DrmType ?? ProsperoDrmType.Standard);
+            param = ProsperoParam.CreateDefault(contentId, edits.TitleId, edits.TitleName, edits.DrmType ?? defaultDrm);
         }
         else param = ProsperoParam.Parse(Utf8.GetString(source));
-        if (edits.TitleId is not null) { ArgumentException.ThrowIfNullOrWhiteSpace(edits.TitleId); param.TitleId = edits.TitleId; }
+        if (edits.TitleId is not null)
+        {
+            if (!ProsperoPackageBuilder.IsValidTitleId(edits.TitleId)) throw new ArgumentException("Title id has an invalid format.");
+            param.TitleId = edits.TitleId;
+        }
         if (edits.TitleName is not null)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(edits.TitleName);

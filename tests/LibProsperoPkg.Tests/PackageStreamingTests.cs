@@ -22,6 +22,9 @@ internal static class PackageStreamingTests
         ParamMetadataEdits();
         ManifestMetadataEdits();
         StreamingElfConversion();
+        DlcModes();
+        HomebrewMode();
+        ModeOptions();
     }
 
     private static byte[] Elf()
@@ -405,6 +408,178 @@ internal static class PackageStreamingTests
             Program.Throws<InvalidDataException>(() => plan.OpenRead(CancellationToken.None));
         }
         finally { Directory.Delete(root, true); }
+    }
+
+    private static void DlcModes()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-dlc-stream-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            foreach (var mode in new[] { ProsperoVolumeType.AdditionalContentData, ProsperoVolumeType.AdditionalContentNoData })
+            foreach (bool kraken in new[] { false, true })
+            {
+                string dir = Path.Combine(root, $"{mode}-{kraken}");
+                Directory.CreateDirectory(dir);
+                string source = Setup(dir);
+                File.Delete(Path.Combine(source, "eboot.bin"));
+                if (mode == ProsperoVolumeType.AdditionalContentNoData)
+                {
+                    Directory.Delete(Path.Combine(source, "assets"), true);
+                    File.Delete(Path.Combine(source, "empty"));
+                }
+                var before = Snapshot(source);
+                string target = Path.Combine(dir, "dlc.pkg");
+                var namedMode = mode == ProsperoVolumeType.AdditionalContentData ? ProsperoPackageMode.AdditionalContentData : ProsperoPackageMode.AdditionalContentNoData;
+                var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                    SourceFolder = source, OutputPath = target, Mode = namedMode, UseKraken = kraken,
+                    ImageSeed = new byte[16], Timestamp = DateTimeOffset.FromUnixTimeSeconds(12345678) });
+                if (mode == ProsperoVolumeType.AdditionalContentData) VerifyPackage(target, source, result, kraken);
+                var parsed = ProsperoPkgReader.Read(target);
+                Program.Equal(true, ProsperoPkgValidator.Validate(parsed, Id).Accepted, "DLC structural validation");
+                Program.Equal(mode == ProsperoVolumeType.AdditionalContentData ? 0x21u : 0x22u, parsed.Header!.ContentType, "DLC CNT content type");
+                Program.Equal(0u, parsed.Header.DrmType, "debug package requires no license");
+                if (mode == ProsperoVolumeType.AdditionalContentNoData) Program.Equal(0u, parsed.Header.ContentFlags, "entitlement-only flags");
+                using (var pkg = File.OpenRead(target))
+                {
+                    pkg.Position = result.MountSize;
+                    using var bytes = new MemoryStream(); pkg.CopyTo(bytes); bytes.Position = 0;
+                    using var zip = new ZipArchive(bytes, ZipArchiveMode.Read);
+                    using var xml = new StreamReader(zip.Entries.Single(e => e.FullName == "common/etc/pfsimage.xml").Open());
+                    string expectedType = mode == ProsperoVolumeType.AdditionalContentData ? "PS5AC" : "PS5AL";
+                    Program.Equal(true, xml.ReadToEnd().Contains("<content-type>" + expectedType + "</content-type>", StringComparison.Ordinal), "DLC SI content type");
+                }
+                if (mode == ProsperoVolumeType.AdditionalContentNoData)
+                    Program.Equal(true, RecoveredPaths(target, result).All(p => p.StartsWith("sce_sys/", StringComparison.Ordinal)), "no-data DLC contains no application payload");
+                foreach (var (name, state) in before) Program.Equal(state, Snapshot(source)[name], "DLC preserves source");
+                if (mode == ProsperoVolumeType.AdditionalContentNoData)
+                {
+                    File.WriteAllText(Path.Combine(source, "payload.bin"), "payload");
+                    string invalid = Path.Combine(dir, "invalid.pkg");
+                    Program.Throws<InvalidDataException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                        SourceFolder = source, OutputPath = invalid, Mode = namedMode }));
+                    Program.Equal(false, File.Exists(invalid) || File.Exists(invalid + ".part"), "no-data DLC rejects payload before output");
+                }
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static void HomebrewMode()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-homebrew-stream-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Path.Combine(root, "homebrew");
+            Directory.CreateDirectory(source);
+            byte[] elf = Elf();
+            File.WriteAllBytes(Path.Combine(source, "main.elf"), elf);
+            File.WriteAllText(Path.Combine(source, "ignored.txt"), "not part of the homebrew tree");
+            File.WriteAllText(Path.Combine(source, "manifest.json"), "{\"applicationName\":\"Before\",\"custom\":123}");
+            var before = Snapshot(source);
+            foreach (bool kraken in new[] { false, true })
+            {
+                string target = Path.Combine(root, $"homebrew-{kraken}.pkg");
+                var result = ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                    SourceFolder = source, OutputPath = target, Mode = ProsperoPackageMode.Homebrew,
+                    HomebrewMainModule = "main.elf", UseKraken = kraken, ContentId = Id, ImageSeed = new byte[16], Passcode = "",
+                    MetadataEdits = new() { GenerateMissingParam = true, TitleId = "PPSA99099", TitleName = "Homebrew",
+                        Manifest = new() { Path = "/manifest.json", ApplicationName = "After" } } });
+                var parsed = ProsperoPkgReader.Read(target);
+                Program.Equal(true, ProsperoPkgValidator.Validate(parsed, Id).Accepted, "homebrew structural validation");
+                var entry = parsed.Entries.Single(e => e.RawId == 0x2000);
+                byte[] pkg = File.ReadAllBytes(target);
+                var param = ProsperoParam.Parse(Encoding.UTF8.GetString(pkg.AsSpan((int)((long)parsed.Fih!.EmbeddedCntOffset + (long)entry.DataOffset), (int)entry.DataSize)).TrimEnd('\0'));
+                Program.Equal("standard", param.ApplicationDrmType, "homebrew generated param follows the default application type");
+                int sbIndex = checked((int)(BinaryPrimitives.ReadUInt64LittleEndian(pkg.AsSpan(0x20)) / B - 1));
+                int innerBlocks = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(pkg.AsSpan(0x90)));
+                byte[] outer = pkg.AsSpan(B, (int)result.PfsSize).ToArray();
+                var kinds = Enumerable.Range(0, outer.Length / B).Select(i => i == sbIndex ? ProsperoOuterBlockKind.Plaintext : i < innerBlocks ? ProsperoOuterBlockKind.Data : ProsperoOuterBlockKind.Signed).ToArray();
+                var (tweak, key) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ProsperoPfsKeys.DeriveEkpfs(Id, new('0', 32)), new byte[16]);
+                ProsperoOuterPfsImage.Transform(outer, tweak, key, B, kinds, encrypt: false);
+                using var reader = new MemoryStream(outer);
+                reader.Position = (sbIndex + 1L) * B + 3 * ProsperoDinodeS32.SizeOf;
+                var inner = ProsperoDinodeS32.ReadFromStream(reader);
+                var naps = ProsperoDinodeS32.ReadFromStream(reader);
+                var mount = ProsperoPs5InnerImageReader.ReconstructMount(outer.AsSpan(inner.db[0].block * B, (int)inner.Size).ToArray(), outer.AsSpan(naps.db[0].block * B, (int)naps.Size).ToArray(), result.InnerLogicalSize);
+                var files = ProsperoPs5InnerImageReader.ReadFileTree(mount.Mount, mount.SuperblockOffset);
+                var main = files.Single(f => f.Path == "eboot.bin");
+                Same(ProsperoFself.MakeFself(elf), mount.Mount.AsSpan((int)main.LogicalOffset, (int)main.Size), "selected homebrew module mapped to eboot.bin");
+                Program.Equal(false, files.Any(f => f.Path == "main.elf" || f.Path == "ignored.txt"), "homebrew source selection matches reference");
+                var manifestFile = files.Single(f => f.Path == "manifest.json");
+                var manifest = ProsperoManifest.Parse(Encoding.UTF8.GetString(mount.Mount.AsSpan((int)manifestFile.LogicalOffset, (int)manifestFile.Size)));
+                Program.Equal("After", manifest.ApplicationName, "explicit Homebrew manifest edit retained");
+                Program.Equal(123, (int)manifest.Root["custom"]!, "Homebrew manifest retains unknown fields");
+            }
+            foreach (var (name, state) in before) Program.Equal(state, Snapshot(source)[name], "homebrew preserves source");
+            File.WriteAllBytes(Path.Combine(source, "main.self"), ProsperoFself.MakeFself(elf));
+            string selfTarget = Path.Combine(root, "homebrew-self.pkg");
+            ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = selfTarget, Mode = ProsperoPackageMode.Homebrew,
+                HomebrewMainModule = "main.self", SignExecutableModules = false, ContentId = Id,
+                MetadataEdits = new() { GenerateMissingParam = true, TitleId = "PPSA99099", TitleName = "Homebrew" } });
+            Program.Equal(true, ProsperoPkgValidator.Validate(ProsperoPkgReader.Read(selfTarget), Id).Accepted, "Homebrew accepts prepared SELF with signing disabled");
+            Program.Throws<NotSupportedException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = Path.Combine(root, "disabled.pkg"), Mode = ProsperoPackageMode.Homebrew,
+                HomebrewMainModule = "main.elf", SignExecutableModules = false, ContentId = Id,
+                MetadataEdits = new() { GenerateMissingParam = true, TitleId = "PPSA99099", TitleName = "Homebrew" } }));
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = Path.Combine(root, "conflict.pkg"), Mode = ProsperoPackageMode.AdditionalContentData,
+                VolumeType = ProsperoVolumeType.AdditionalContentNoData }));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static void ModeOptions()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "prospero-options-stream-" + Guid.NewGuid());
+        Directory.CreateDirectory(root);
+        try
+        {
+            string source = Setup(root);
+            File.Delete(Path.Combine(source, "sce_sys", "param.json"));
+            foreach (var (drmOverride, expected) in new[] {
+                ((ProsperoDrmType?)null, "freemium"),
+                ((ProsperoDrmType?)ProsperoDrmType.Standard, "standard") })
+            {
+                string target = Path.Combine(root, $"{expected}.pkg");
+                ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                    SourceFolder = source, OutputPath = target, ContentId = Id, Mode = ProsperoPackageMode.Application,
+                    ApplicationType = ProsperoApplicationType.FreemiumApp,
+                    MetadataEdits = new() { GenerateMissingParam = true, TitleId = "PPSA99099", TitleName = "Options", DrmType = drmOverride } });
+                var parsed = ProsperoPkgReader.Read(target);
+                var entry = parsed.Entries.Single(e => e.RawId == 0x2000);
+                byte[] pkg = File.ReadAllBytes(target);
+                var param = ProsperoParam.Parse(Encoding.UTF8.GetString(pkg.AsSpan((int)((long)parsed.Fih!.EmbeddedCntOffset + (long)entry.DataOffset), (int)entry.DataSize)).TrimEnd('\0'));
+                Program.Equal(expected, param.ApplicationDrmType, "generated param respects application type and DRM override");
+            }
+            Program.Equal(false, File.Exists(Path.Combine(source, "sce_sys", "param.json")), "generated metadata is never written to source");
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = Path.Combine(root, "bad-id.pkg"), ContentId = new string('A', 36),
+                MetadataEdits = new() { GenerateMissingParam = true, TitleId = "PPSA99099", TitleName = "Options" } }));
+            Program.Throws<ArgumentException>(() => ProsperoPkgBuilder.BuildLocalStreaming(new ProsperoStreamingPackageOptions {
+                SourceFolder = source, OutputPath = Path.Combine(root, "bad-title.pkg"), ContentId = Id,
+                MetadataEdits = new() { GenerateMissingParam = true, TitleId = "not-valid", TitleName = "Options" } }));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    private static string[] RecoveredPaths(string target, ProsperoStreamingPackageResult result)
+    {
+        byte[] package = File.ReadAllBytes(target);
+        int sbIndex = checked((int)(BinaryPrimitives.ReadUInt64LittleEndian(package.AsSpan(0x20)) / B - 1));
+        int innerBlocks = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(package.AsSpan(0x90)));
+        byte[] outer = package.AsSpan(B, (int)result.PfsSize).ToArray();
+        var kinds = Enumerable.Range(0, outer.Length / B).Select(i => i == sbIndex ? ProsperoOuterBlockKind.Plaintext : i < innerBlocks ? ProsperoOuterBlockKind.Data : ProsperoOuterBlockKind.Signed).ToArray();
+        var (tweak, key) = ProsperoPfsKeys.DeriveImageEncryptionKeys(ProsperoPfsKeys.DeriveEkpfs(Id, new('0', 32)), new byte[16]);
+        ProsperoOuterPfsImage.Transform(outer, tweak, key, B, kinds, encrypt: false);
+        using var reader = new MemoryStream(outer);
+        reader.Position = (sbIndex + 1L) * B + 3 * ProsperoDinodeS32.SizeOf;
+        var inner = ProsperoDinodeS32.ReadFromStream(reader);
+        var naps = ProsperoDinodeS32.ReadFromStream(reader);
+        var mount = ProsperoPs5InnerImageReader.ReconstructMount(outer.AsSpan(inner.db[0].block * B, (int)inner.Size).ToArray(), outer.AsSpan(naps.db[0].block * B, (int)naps.Size).ToArray(), result.InnerLogicalSize);
+        return ProsperoPs5InnerImageReader.ReadFileTree(mount.Mount, mount.SuperblockOffset).Select(f => f.Path).ToArray();
     }
 
     private sealed class SyntheticElfReader(byte[] header, long length, Action<int> onRead) : Stream
